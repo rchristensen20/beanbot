@@ -1,3 +1,4 @@
+import asyncio
 import discord
 from discord.ext import commands, tasks
 import os
@@ -754,11 +755,20 @@ class BeanBot(commands.Bot):
         config = {"configurable": {"thread_id": thread_id}} if thread_id else {}
 
         try:
-            result = await graph_module.app_graph.ainvoke(inputs, config=config)
+            result = await asyncio.wait_for(
+                graph_module.app_graph.ainvoke(inputs, config=config),
+                timeout=60,
+            )
             final_message = result["messages"][-1]
             return self._extract_text(final_message.content)
+        except asyncio.TimeoutError:
+            logger.error("LangGraph execution timed out after 60 seconds")
+            return "Sorry, that took too long — I wasn't able to get a response in time. Please try again in a moment."
         except Exception as e:
             logger.error(f"Error in LangGraph execution: {e}", exc_info=True)
+            err_str = str(e).lower()
+            if "resource" in err_str and "exhausted" in err_str or "429" in str(e) or "quota" in err_str:
+                return "I've hit my API usage limit — please wait a few minutes before sending another message. I'll be back shortly!"
             return "I encountered an error processing your request."
 
     @tasks.loop(time=time(hour=8, minute=0, tzinfo=BOT_TZ))
@@ -822,7 +832,10 @@ class BeanBot(commands.Bot):
         ephemeral_thread_id = f"daily_report_{today}"
         config = {"configurable": {"thread_id": ephemeral_thread_id}}
         try:
-            result = await graph_module.app_graph.ainvoke(inputs, config=config)
+            result = await asyncio.wait_for(
+                graph_module.app_graph.ainvoke(inputs, config=config),
+                timeout=60,
+            )
             response = self._extract_text(result["messages"][-1].content)
 
             # Write weather + forecast + briefing to daily file for tool access
@@ -846,10 +859,18 @@ class BeanBot(commands.Bot):
                 await channel.send(f"**Morning Briefing:**\n{response}")
             elif manual:
                 await channel.send("Nothing urgent today — all clear!")
+        except asyncio.TimeoutError:
+            logger.error("Daily report timed out after 60 seconds")
+            if channel:
+                await channel.send("The daily briefing timed out — I'll try again tomorrow. You can also run `!briefing` to retry manually.")
         except Exception as e:
             logger.error(f"Daily report failed: {e}")
             if channel:
-                await channel.send(f"Error generating briefing: {e}")
+                err_str = str(e).lower()
+                if "resource" in err_str and "exhausted" in err_str or "429" in str(e) or "quota" in err_str:
+                    await channel.send("I've hit my API usage limit — the daily briefing will resume once the quota resets. Try `!briefing` later.")
+                else:
+                    await channel.send(f"Error generating briefing: {e}")
 
     @daily_report.before_loop
     async def before_daily_report(self):
