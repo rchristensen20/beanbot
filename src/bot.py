@@ -318,6 +318,10 @@ class BeanBot(commands.Bot):
 
         # Handle knowledge ingestion channel
         if is_ingest:
+            ctx = await self.get_context(message)
+            if ctx.valid:
+                await self.process_commands(message)
+                return
             async with message.channel.typing():
                 # Extract image attachments separately
                 image_data = await self._extract_images(message)
