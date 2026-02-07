@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Ryanbot is a personal gardening assistant Discord bot for a small farm in Colorado (Zone 5b, Mountain Time). It uses a LangGraph agentic workflow backed by Google Vertex AI (Gemini) to manage a markdown-based knowledge library, task list, harvest log, and garden journal.
+Farmbot is a personal gardening assistant Discord bot for a small farm in Colorado (Zone 5b, Mountain Time). It uses a LangGraph agentic workflow backed by Google Vertex AI (Gemini) to manage a markdown-based knowledge library, task list, harvest log, and garden journal.
 
 ## Tech Stack
 

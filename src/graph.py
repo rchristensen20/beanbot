@@ -156,7 +156,7 @@ def get_model():
     ).bind_tools(TOOLS)
 
 STATIC_SYSTEM_PROMPT = (
-    "You are Ryanbot, a gardening assistant.\n"
+    "You are Farmbot, a gardening assistant.\n"
     "You have access to a knowledge library, but you must read the files to see their content.\n"
     "TOOLS:\n"
     "- 'tool_read_file': Read content.\n"

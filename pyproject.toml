@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "ryanbot"
+name = "farmbot"
 version = "0.2.0"
 description = "A production-grade personal assistant Discord bot using LangGraph and Vertex AI."
 readme = "README.md"

@@ -19,7 +19,7 @@ from src.graph import categorize_files, suggest_merges
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("ryanbot")
+logger = logging.getLogger("farmbot")
 
 class DebriefModal(discord.ui.Modal, title="Daily Garden Debrief"):
     activities = discord.ui.TextInput(
@@ -53,7 +53,7 @@ class DebriefModal(discord.ui.Modal, title="Daily Garden Debrief"):
         required=False,
     )
 
-    def __init__(self, bot: "RyanBot"):
+    def __init__(self, bot: "FarmBot"):
         super().__init__()
         self.bot = bot
 
@@ -96,7 +96,7 @@ class DebriefModal(discord.ui.Modal, title="Daily Garden Debrief"):
 
 
 class DebriefView(discord.ui.View):
-    def __init__(self, bot: "RyanBot"):
+    def __init__(self, bot: "FarmBot"):
         super().__init__(timeout=None)
         self.bot = bot
 
@@ -109,7 +109,7 @@ class DebriefView(discord.ui.View):
         await interaction.response.send_modal(DebriefModal(self.bot))
 
 
-class RyanBot(commands.Bot):
+class FarmBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
@@ -150,7 +150,7 @@ class RyanBot(commands.Bot):
         self.daily_debrief.start()
         self.weather_alerts.start()
         self.weekly_recap.start()
-        logger.info("RyanBot setup complete. All schedulers started.")
+        logger.info("FarmBot setup complete. All schedulers started.")
 
     async def on_ready(self):
         logger.info(f"Logged in as {self.user} (ID: {self.user.id})")
@@ -940,5 +940,5 @@ if __name__ == "__main__":
     if not token:
         raise ValueError("DISCORD_TOKEN not found in environment variables.")
         
-    bot = RyanBot()
+    bot = FarmBot()
     bot.run(token, log_handler=None)

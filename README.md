@@ -1,4 +1,4 @@
-# Ryanbot
+# Farmbot
 
 A personal gardening assistant Discord bot powered by an agentic AI workflow.
 
@@ -51,7 +51,7 @@ A personal gardening assistant Discord bot powered by an agentic AI workflow.
 ### File Structure
 
 ```
-ryanbot/
+farmbot/
 ├── src/
 │   ├── bot.py                # Discord bot, message routing, daily cron
 │   ├── graph.py              # LangGraph state machine (agent ↔ tools loop)
