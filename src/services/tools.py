@@ -524,6 +524,60 @@ def build_library_index() -> list[dict]:
 
     return grouped
 
+def get_clearable_knowledge_files() -> list[str]:
+    """Returns filenames of all non-system, non-daily .md files that can be cleared."""
+    return [os.path.basename(p) for p in _list_md_paths()]
+
+
+def clear_all_knowledge_files() -> tuple[list[str], list[str]]:
+    """
+    Deletes all non-system knowledge files.
+    Returns (deleted_names, errors).
+    """
+    deleted = []
+    errors = []
+    for path in _list_md_paths():
+        name = os.path.basename(path)
+        try:
+            os.remove(path)
+            deleted.append(name)
+        except Exception as e:
+            logger.error(f"Failed to delete {name}: {e}")
+            errors.append(f"{name}: {e}")
+    return deleted, errors
+
+
+def clear_entire_garden() -> dict:
+    """
+    Factory reset — removes everything in data/.
+    Returns {"deleted_files": [...], "deleted_dirs": [...], "errors": [...]}.
+    """
+    abs_data_dir = os.path.abspath(DATA_DIR)
+    deleted_files = []
+    deleted_dirs = []
+    errors = []
+
+    for entry in os.listdir(abs_data_dir):
+        entry_path = os.path.join(abs_data_dir, entry)
+        # Defense-in-depth: verify resolved path is inside data/
+        resolved = os.path.realpath(entry_path)
+        if not resolved.startswith(abs_data_dir):
+            errors.append(f"{entry}: path escapes data directory, skipped")
+            continue
+        try:
+            if os.path.isdir(resolved):
+                shutil.rmtree(resolved)
+                deleted_dirs.append(entry)
+            else:
+                os.remove(resolved)
+                deleted_files.append(entry)
+        except Exception as e:
+            logger.error(f"Failed to remove {entry}: {e}")
+            errors.append(f"{entry}: {e}")
+
+    return {"deleted_files": deleted_files, "deleted_dirs": deleted_dirs, "errors": errors}
+
+
 def complete_task(task_snippet: str) -> str:
     """
     Marks a task as complete in 'tasks.md' by finding a matching line.

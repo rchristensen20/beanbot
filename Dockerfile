@@ -22,5 +22,9 @@ RUN uv sync --frozen
 # Create data directory (populated at runtime via volume mount or bot usage)
 RUN mkdir -p data
 
+# Non-root user: bot process can only write to data/
+RUN useradd --create-home --uid 1000 beanbot && chown beanbot:beanbot data
+USER beanbot
+
 # Command to run the bot
 CMD ["python", "src/bot.py"]

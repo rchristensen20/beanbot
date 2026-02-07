@@ -16,7 +16,7 @@ BOT_TZ = ZoneInfo(os.getenv("BOT_TIMEZONE", "America/Denver"))
 from src.graph import init_graph
 import src.graph as graph_module
 # Import basic file reader for the daily report
-from src.services.tools import read_knowledge_file, get_open_tasks, find_related_files, search_file_contents, build_library_index, get_library_files, is_onboarding_complete, register_member, get_member_name_by_discord_id, list_members, get_tasks_for_user
+from src.services.tools import read_knowledge_file, get_open_tasks, find_related_files, search_file_contents, build_library_index, get_library_files, is_onboarding_complete, register_member, get_member_name_by_discord_id, list_members, get_tasks_for_user, get_clearable_knowledge_files, clear_all_knowledge_files, clear_entire_garden, delete_knowledge_file, _sanitize_topic, SYSTEM_FILES, DATA_DIR
 from src.services.categorization import categorize_files, suggest_merges
 from src.services.weather import fetch_current_weather, fetch_forecast
 
@@ -172,6 +172,48 @@ class DebriefView(discord.ui.View):
         await interaction.response.send_modal(DebriefModal(self.bot))
 
 
+class ConfirmView(discord.ui.View):
+    """Reusable non-persistent confirmation view with author-gated buttons."""
+
+    def __init__(self, confirm_label: str, on_confirm, author_id: int, timeout: float = 120):
+        super().__init__(timeout=timeout)
+        self.on_confirm_callback = on_confirm
+        self.author_id = author_id
+        self.message: discord.Message | None = None
+
+        confirm_btn = discord.ui.Button(label=confirm_label, style=discord.ButtonStyle.danger)
+        cancel_btn = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.secondary)
+
+        confirm_btn.callback = self._confirm
+        cancel_btn.callback = self._cancel
+
+        self.add_item(confirm_btn)
+        self.add_item(cancel_btn)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "Only the person who initiated this command can confirm.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def _confirm(self, interaction: discord.Interaction):
+        await self.on_confirm_callback(interaction)
+        self.stop()
+
+    async def _cancel(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(content="Cancelled. No files were deleted.", view=None)
+        self.stop()
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                await self.message.edit(content="Confirmation timed out. No files were deleted.", view=None)
+            except Exception:
+                pass
+
+
 class BeanBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -225,6 +267,10 @@ class BeanBot(commands.Bot):
         async def version_cmd(ctx):
             await ctx.send(f"Beanbot v{BOT_VERSION}")
 
+        @self.command(name="clear")
+        async def clear_cmd(ctx, *, topic: str = ""):
+            await self.clear(ctx, topic.strip())
+
     async def setup_hook(self):
         await init_graph()
         logger.info("Conversation memory initialized.")
@@ -269,10 +315,192 @@ class BeanBot(commands.Bot):
             "`!register <name> @user` — Register someone else as a garden member\n"
             "`!members` — List all registered garden members\n"
             "`!setup` — Run first-time onboarding (location, garden layout, orientation)\n"
+            "`!clear <topic>` — Delete a single knowledge file (2-step confirmation)\n"
+            "`!clear knowledge` — Delete all knowledge files, keep system files (3-step confirmation)\n"
+            "`!clear garden` — Factory reset: delete everything in data/ (3-step confirmation)\n"
             "`!version` — Show the current Beanbot version\n"
             "`!commands` — Show this help message"
         )
         await ctx.send(text)
+
+    async def clear(self, ctx, topic: str):
+        """Route !clear to the appropriate sub-method."""
+        allowed = [self.reminders_channel_id, self.journal_channel_id, self.questions_channel_id]
+        if ctx.channel.id not in allowed:
+            await ctx.send("This command can only be used in the reminders, journal, or questions channel.")
+            return
+
+        if not topic:
+            await ctx.send(
+                "**Usage:**\n"
+                "`!clear <topic>` — Delete a single knowledge file\n"
+                "`!clear knowledge` — Delete all knowledge files (keeps system files)\n"
+                "`!clear garden` — Factory reset (deletes everything in data/)"
+            )
+            return
+
+        if topic.lower() == "garden":
+            await self._clear_garden(ctx)
+        elif topic.lower() == "knowledge":
+            await self._clear_knowledge(ctx)
+        else:
+            await self._clear_topic(ctx, topic)
+
+    async def _clear_topic(self, ctx, topic: str):
+        """Delete a single knowledge file with 2-step confirmation."""
+        safe = _sanitize_topic(topic)
+        filename = f"{safe}.md"
+
+        if filename in SYSTEM_FILES:
+            await ctx.send(f"`{filename}` is a protected system file and cannot be deleted.")
+            return
+
+        filepath = os.path.join(DATA_DIR, filename)
+        if not os.path.exists(filepath):
+            await ctx.send(f"File `{filename}` not found.")
+            return
+
+        size = os.path.getsize(filepath)
+        size_str = self._format_size(size)
+
+        # Step 1
+        async def step2(interaction: discord.Interaction):
+            view2 = ConfirmView(f"Delete {filename}", final_confirm, ctx.author.id)
+            await interaction.response.edit_message(
+                content=f"**Are you sure?** This will permanently delete `{filename}` ({size_str}). This cannot be undone.",
+                view=view2,
+            )
+            view2.message = interaction.message
+
+        # Step 2 (final)
+        async def final_confirm(interaction: discord.Interaction):
+            result = delete_knowledge_file(filename)
+            await interaction.response.edit_message(content=f"Deleted `{filename}`.", view=None)
+
+        view1 = ConfirmView("Continue", step2, ctx.author.id)
+        msg = await ctx.send(
+            f"**Clear file:** `{filename}` ({size_str})\n\nThis will permanently delete this knowledge file.",
+            view=view1,
+        )
+        view1.message = msg
+
+    async def _clear_knowledge(self, ctx):
+        """Delete all non-system knowledge files with 3-step confirmation."""
+        files = get_clearable_knowledge_files()
+        if not files:
+            await ctx.send("No knowledge files to delete.")
+            return
+
+        count = len(files)
+        file_list = ", ".join(f"`{f}`" for f in sorted(files)[:20])
+        if count > 20:
+            file_list += f" ... and {count - 20} more"
+
+        # Step 1
+        async def step2(interaction: discord.Interaction):
+            view2 = ConfirmView("Continue", step3, ctx.author.id)
+            await interaction.response.edit_message(
+                content=(
+                    f"**Second confirmation.** You are about to delete **{count}** knowledge files.\n\n"
+                    f"System files (tasks, harvests, almanac, etc.) will NOT be touched.\n"
+                    f"This cannot be undone."
+                ),
+                view=view2,
+            )
+            view2.message = interaction.message
+
+        # Step 2
+        async def step3(interaction: discord.Interaction):
+            view3 = ConfirmView(f"Delete all {count} files", final_confirm, ctx.author.id)
+            await interaction.response.edit_message(
+                content=f"**Final confirmation.** Click below to permanently delete all {count} knowledge files.",
+                view=view3,
+            )
+            view3.message = interaction.message
+
+        # Step 3 (final)
+        async def final_confirm(interaction: discord.Interaction):
+            deleted, errors = clear_all_knowledge_files()
+            summary = f"Deleted **{len(deleted)}** knowledge file(s)."
+            if errors:
+                summary += f"\n\nErrors ({len(errors)}):\n" + "\n".join(f"- {e}" for e in errors)
+            await interaction.response.edit_message(content=summary, view=None)
+
+        view1 = ConfirmView("I understand, continue", step2, ctx.author.id)
+        msg = await ctx.send(
+            f"**Clear knowledge library** — this will delete **{count}** file(s):\n{file_list}\n\n"
+            f"System files will be preserved.",
+            view=view1,
+        )
+        view1.message = msg
+
+    async def _clear_garden(self, ctx):
+        """Factory reset with 3-step confirmation."""
+        # Inventory what will be deleted
+        knowledge_files = get_clearable_knowledge_files()
+        system_files = [f for f in os.listdir(DATA_DIR) if f in SYSTEM_FILES and os.path.isfile(os.path.join(DATA_DIR, f))]
+        other_files = [
+            f for f in os.listdir(DATA_DIR)
+            if os.path.isfile(os.path.join(DATA_DIR, f)) and f not in SYSTEM_FILES and f not in knowledge_files
+        ]
+        dirs = [d for d in os.listdir(DATA_DIR) if os.path.isdir(os.path.join(DATA_DIR, d))]
+
+        # Step 1
+        async def step2(interaction: discord.Interaction):
+            view2 = ConfirmView("Continue", step3, ctx.author.id)
+            await interaction.response.edit_message(
+                content=(
+                    "**This will delete EVERYTHING in data/:**\n"
+                    "- All knowledge files\n"
+                    "- System files (tasks, harvests, almanac, garden log, etc.)\n"
+                    "- Conversation memory (conversations.db)\n"
+                    "- Member registry (members.json)\n"
+                    "- All backups\n"
+                    "- Weather alert flags\n\n"
+                    "**Nothing will be recoverable.**"
+                ),
+                view=view2,
+            )
+            view2.message = interaction.message
+
+        # Step 2
+        async def step3(interaction: discord.Interaction):
+            view3 = ConfirmView("Reset everything", final_confirm, ctx.author.id)
+            await interaction.response.edit_message(
+                content="**POINT OF NO RETURN.** Click below to factory-reset your entire garden.",
+                view=view3,
+            )
+            view3.message = interaction.message
+
+        # Step 3 (final)
+        async def final_confirm(interaction: discord.Interaction):
+            result = clear_entire_garden()
+            n_files = len(result["deleted_files"])
+            n_dirs = len(result["deleted_dirs"])
+            summary = f"Factory reset complete. Deleted **{n_files}** file(s) and **{n_dirs}** directory/directories."
+            if result["errors"]:
+                summary += f"\n\nErrors ({len(result['errors'])}):\n" + "\n".join(f"- {e}" for e in result["errors"])
+            await interaction.response.edit_message(content=summary, view=None)
+
+        inventory_lines = []
+        if knowledge_files:
+            inventory_lines.append(f"- **{len(knowledge_files)}** knowledge files")
+        if system_files:
+            inventory_lines.append(f"- **{len(system_files)}** system files ({', '.join(system_files)})")
+        if other_files:
+            inventory_lines.append(f"- **{len(other_files)}** other files ({', '.join(other_files[:5])}{'...' if len(other_files) > 5 else ''})")
+        if dirs:
+            inventory_lines.append(f"- **{len(dirs)}** directories ({', '.join(dirs)})")
+
+        inventory = "\n".join(inventory_lines) if inventory_lines else "- (data/ is empty)"
+
+        view1 = ConfirmView("I understand", step2, ctx.author.id)
+        msg = await ctx.send(
+            f"**Factory reset** — this will delete everything in `data/`:\n{inventory}\n\n"
+            f"This is irreversible. All knowledge, tasks, logs, conversations, and backups will be gone.",
+            view=view1,
+        )
+        view1.message = msg
 
     def _inject_mentions(self, text: str) -> str:
         """Replace registered member names with Discord @mentions in text."""

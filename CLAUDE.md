@@ -49,6 +49,9 @@ data/                           → Markdown knowledge library (auto-managed by 
 - `!register <name>` — Register the calling user as a named garden member. Creates/updates `data/members.json`.
 - `!register <name> @user` — Register a mentioned user as a named member (admin use).
 - `!members` — List all registered garden members with Discord @mentions.
+- `!clear <topic>` — Delete a single knowledge file with 2-step confirmation (questions, reminders, or journal channel).
+- `!clear knowledge` — Delete all non-system knowledge files with 3-step confirmation. System files (tasks, harvests, almanac, etc.) are preserved.
+- `!clear garden` — Factory reset: deletes everything in `data/` (all files, conversations.db, members.json, backups/, .alert_flag) with 3-step confirmation.
 - `!commands` — Show a help message listing all commands with brief usage.
 - `!version` — Show the current Beanbot version (parsed from `pyproject.toml` at import time).
 
@@ -107,3 +110,6 @@ uv run bump-my-version bump patch|minor|major
 - **Onboarding detection**: `is_onboarding_complete()` in `tools.py` checks if `data/almanac.md` exists. When incomplete, DMs route through the `"onboarding"` channel context instead of `"dm"`. The `!setup` command initiates onboarding, redirecting to DMs if called from a channel.
 - **Member registry & task assignment**: `data/members.json` stores `{lowercase_name: discord_id}` mappings. `register_member()` / `list_members()` / `get_member_name_by_discord_id()` in `tools.py` manage it. Tasks can have an `[Assigned: Name]` tag between description and `[Due:]`. `get_tasks_for_user(name)` returns tasks assigned to that user + unassigned tasks, excluding tasks assigned to others. `_inject_mentions()` in `bot.py` replaces registered names with `<@id>` Discord mentions in daily briefing output only. The `[User: Name]` prefix is injected into message content in `on_message` for registered users so the LLM knows who's asking. `members.json` is `.json`, not `.md`, so it's already ignored by `_list_md_paths` and `delete_knowledge_file`.
 - **Version**: `_read_version()` in `bot.py` parses version from `pyproject.toml` at import time, cached as `BOT_VERSION`. Use `uv run bump-my-version bump patch|minor|major` to release (updates `pyproject.toml` + `CHANGELOG.md`, creates commit + tag).
+- **`!clear` reserved words**: `garden` and `knowledge` are reserved arguments for `!clear` — they trigger bulk/factory-reset flows instead of deleting a file named `garden.md` or `knowledge.md`. Single-file deletion uses `_sanitize_topic()` and checks `SYSTEM_FILES` to prevent deleting protected files.
+- **`!clear` confirmations**: `ConfirmView` is non-persistent (no `custom_id`, not registered in `setup_hook`). Each confirmation step edits the original message in-place. `interaction_check()` gates buttons to the initiating user. Timeout is 120 seconds per step.
+- **Docker non-root user**: The Dockerfile creates a `beanbot` user (UID 1000) and only grants write access to `data/`. Source code is root-owned and read-only. This prevents path traversal or code modification even if the LLM crafts a malicious path.
