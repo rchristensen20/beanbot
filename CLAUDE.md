@@ -69,6 +69,7 @@ Required in `.env` (or Docker environment):
 - `GOOGLE_API_KEY`, `GEMINI_MODEL`
 - `OPENWEATHER_API_KEY`, `WEATHER_LAT`, `WEATHER_LON`
 - `BOT_TIMEZONE` (optional, default: `America/Denver`)
+- `LLM_TIMEOUT` (optional, default: `60`) — seconds before LLM calls time out
 
 ## Development
 
