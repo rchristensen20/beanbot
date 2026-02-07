@@ -27,6 +27,7 @@ logger = logging.getLogger("beanbot")
 
 DISCORD_MESSAGE_LIMIT = 2000
 INGESTION_CHUNK_SIZE = 50_000
+LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "60"))
 
 
 def _read_version() -> str:
@@ -757,12 +758,12 @@ class BeanBot(commands.Bot):
         try:
             result = await asyncio.wait_for(
                 graph_module.app_graph.ainvoke(inputs, config=config),
-                timeout=60,
+                timeout=LLM_TIMEOUT,
             )
             final_message = result["messages"][-1]
             return self._extract_text(final_message.content)
         except asyncio.TimeoutError:
-            logger.error("LangGraph execution timed out after 60 seconds")
+            logger.error(f"LangGraph execution timed out after {LLM_TIMEOUT} seconds")
             return "Sorry, that took too long — I wasn't able to get a response in time. Please try again in a moment."
         except Exception as e:
             logger.error(f"Error in LangGraph execution: {e}", exc_info=True)
@@ -834,7 +835,7 @@ class BeanBot(commands.Bot):
         try:
             result = await asyncio.wait_for(
                 graph_module.app_graph.ainvoke(inputs, config=config),
-                timeout=60,
+                timeout=LLM_TIMEOUT,
             )
             response = self._extract_text(result["messages"][-1].content)
 
@@ -860,7 +861,7 @@ class BeanBot(commands.Bot):
             elif manual:
                 await channel.send("Nothing urgent today — all clear!")
         except asyncio.TimeoutError:
-            logger.error("Daily report timed out after 60 seconds")
+            logger.error(f"Daily report timed out after {LLM_TIMEOUT} seconds")
             if channel:
                 await channel.send("The daily briefing timed out — I'll try again tomorrow. You can also run `!briefing` to retry manually.")
         except Exception as e:
