@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-02-07
+
 ### Added
 - Member registry (`data/members.json`) with `!register <name>` and `!members` commands
 - Task assignment via `[Assigned: Name]` tags — assign tasks to specific people
