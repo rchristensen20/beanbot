@@ -1,8 +1,8 @@
-# Farmbot
+# Beanbot
 
 A personal gardening assistant Discord bot powered by an agentic AI workflow.
 
-**Built with:** Discord.py | LangGraph | Google Vertex AI (Gemini) | OpenWeatherMap | Docker
+**Built with:** Discord.py | LangGraph | Google Gemini | OpenWeatherMap | Docker
 
 ## Features
 
@@ -23,150 +23,151 @@ A personal gardening assistant Discord bot powered by an agentic AI workflow.
   - **Knowledge Ingest** — paste URLs, upload files, or type text for auto-ingestion
   - **DMs** — general conversation
 
-- **Daily briefing** — 8:00 AM MT cron (configurable). Fetches current weather **and a 48-hour forecast**, checks `tasks.md` for due items, reviews the `planting_calendar.md`, and reads recent logs to provide a morning summary. If rain is expected, it advises you may not need to water. If frost is expected, it suggests covering sensitive plants. Supports manual triggering via `!briefing`.
+- **Daily briefing** — morning cron job. Fetches current weather and a 48-hour forecast, checks `tasks.md` for due items, reviews the `planting_calendar.md`, and reads recent logs to provide a morning summary. Includes frost/rain-based watering and protection advice. Supports manual triggering via `!briefing`.
 
-- **Evening debrief** — 8:00 PM MT cron. Posts a summary of open tasks in the journal channel with a **"Log Today's Debrief"** button. Clicking the button opens a Discord modal with 5 optional fields (Activities, Harvests, Pest/Disease, Observations, Task Updates). On submit, the structured data is sent through the LLM agent, which logs activities, records harvests, marks tasks complete, and amends knowledge as needed. Supports manual triggering via `!debrief`. Buttons persist across bot restarts.
+- **Evening debrief** — evening cron job. Posts a summary of open tasks in the journal channel with a **"Log Today's Debrief"** button. Clicking the button opens a Discord modal with 5 optional fields (Activities, Harvests, Pest/Disease, Observations, Task Updates). On submit, the structured data is sent through the LLM agent. Supports manual triggering via `!debrief`. Buttons persist across bot restarts.
 
-- **Knowledge ingestion pipeline** — Send a URL, upload a file, or paste raw text. The bot extracts content, chunks it, and writes structured notes to per-topic markdown files.
+- **Knowledge ingestion pipeline** — Send a URL, upload a file (including PDFs), or paste raw text. The bot extracts content, chunks it, and writes structured notes to per-topic markdown files.
 
 - **Weather integration** — OpenWeatherMap API for current conditions and 48-hour forecast.
 
-- **Proactive weather alerts** — Checks the forecast every 6 hours. Posts alerts to the reminders channel when frost (≤ 2°C) or significant rain (≥ 60% chance or ≥ 10mm) is expected. Max one alert per day to avoid spam.
+- **Proactive weather alerts** — Checks the forecast every 6 hours. Posts alerts to the reminders channel when frost (≤ 2°C) or significant rain (≥ 60% chance or ≥ 10mm) is expected. Max one alert per day.
 
-- **Weekly recap** — Automatic 7-day garden summary every Sunday at 8:00 PM MT, posted to the reminders channel. Covers activities, harvests, task progress, and highlights. Also available on-demand via `!recap [days]`.
+- **Weekly recap** — Automatic 7-day garden summary every Sunday, posted to the reminders channel. Also available on-demand via `!recap [days]`.
+
+- **Image understanding** — Upload garden photos for plant/pest identification or layout mapping via Gemini's vision capabilities.
+
+- **Onboarding flow** — First-time setup via DM (`!setup`). The bot walks you through location/zone detection, garden layout, knowledge building guidance, and channel orientation. Creates `almanac.md` and `farm_layout.md` automatically.
 
 - **Docker deployment** — single `docker-compose up` with volume persistence.
 
-- **Smart long-message handling** — auto-splits replies at 2,000 characters.
+## Quick Start
 
-## Setup
+### 1. Create a Discord Bot
 
-### Prerequisites
+1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) and create a new application.
+2. Go to **Bot** → enable **Message Content Intent**.
+3. Go to **OAuth2** → **URL Generator** → select `bot` scope with these permissions: Send Messages, Read Messages/View Channels, Read Message History, Embed Links, Attach Files, Use Slash Commands.
+4. Copy the generated URL, open it in your browser, and invite the bot to your server.
+5. Copy the **Bot Token** from the Bot page.
 
-- Docker & Docker Compose
-- Google Cloud project with Vertex AI API enabled
-- Discord bot token (with message content intent)
-- OpenWeatherMap API key (free tier)
+### 2. Get a Gemini API Key
 
-### File Structure
+1. Go to [Google AI Studio](https://aistudio.google.com/apikey).
+2. Create a new API key (free tier is sufficient to start).
 
+### 3. Get an OpenWeatherMap API Key
+
+1. Sign up at [OpenWeatherMap](https://openweathermap.org/api).
+2. The free tier works fine.
+
+### 4. Get Your Channel IDs
+
+1. In Discord, go to **User Settings** → **Advanced** → enable **Developer Mode**.
+2. Create 4 channels in your server (e.g. `#reminders`, `#journal`, `#questions`, `#knowledge-ingest`).
+3. Right-click each channel → **Copy Channel ID**.
+
+### 5. Configure
+
+```bash
+cp .env.example .env
 ```
-farmbot/
-├── src/
-│   ├── bot.py                    # Discord bot, message routing, commands, scheduled crons
-│   ├── graph.py                  # LangGraph state machine (agent ↔ tools loop)
-│   └── services/
-│       ├── tools.py              # File I/O tools (tasks, harvests, calendar, search)
-│       ├── weather.py            # Async weather/forecast fetchers (OpenWeatherMap)
-│       └── categorization.py     # LLM-based file categorization and merge suggestions
-├── data/                         # Markdown knowledge library (auto-managed)
-│   └── backups/                  # Consolidation backups (timestamped)
-├── privatecredentials/           # Google Cloud service account key (git-ignored)
-│   └── credentials.json
-├── docker-compose.yml
-├── Dockerfile
-├── pyproject.toml
-└── .env                          # Environment variables (git-ignored)
-```
 
-### Environment Variables
+Edit `.env` and fill in your values.
 
-Create a `.env` file in the project root:
+### 6. Run
 
-| Variable | Description |
-|---|---|
-| `DISCORD_TOKEN` | Your Discord bot token |
-| `REMINDERS_CHANNEL_ID` | Channel ID for daily briefings |
-| `JOURNAL_CHANNEL_ID` | Channel ID for journal updates |
-| `QUESTIONS_CHANNEL_ID` | Channel ID for Q&A |
-| `KNOWLEDGE_INGEST_CHANNEL_ID` | Channel ID for knowledge ingestion |
-| `GCP_PROJECT` | Google Cloud project ID |
-| `GCP_LOCATION` | Vertex AI region (default: `us-central1`) |
-| `VERTEX_MODEL` | Gemini model name (default: `gemini-2.5-flash`) |
-| `OPENWEATHER_API_KEY` | OpenWeatherMap API key |
-| `WEATHER_LAT` | Latitude for weather lookups |
-| `WEATHER_LON` | Longitude for weather lookups |
-
-### Google Cloud Credentials
-
-1. Create a service account with the **Vertex AI User** role.
-2. Download the JSON key, rename it to `credentials.json`.
-3. Place it in `privatecredentials/`.
-
-The Docker container mounts this directory and sets `GOOGLE_APPLICATION_CREDENTIALS` automatically.
-
-### Running
-
+**Docker (recommended):**
 ```bash
 docker-compose up --build -d
 ```
 
-## How to Use
+**Local:**
+```bash
+uv sync
+python -m src.bot
+```
 
-**Journal / Reminders / Questions**
-Interact naturally in these channels. The agent uses tools to persist your data.
+## Environment Variables
 
-*   **Manage Tasks**
-    *   "Remind me to prune the roses on Sunday."
-    *   "What do I have to do today?"
-    *   "I finished the pruning task." (The agent will mark it as complete in `tasks.md`)
-
-*   **Track Harvests**
-    *   "Harvested 3 lbs of beans from Bed 2."
-    *   "Log a harvest of 10 zucchini."
-
-*   **Consult Calendar**
-    *   "When should I plant garlic?" (Checks `planting_calendar.md`)
-    *   "Generate a planting calendar." (Scans all plant files to rebuild the calendar)
-
-*   **Log Updates**
-    *   "Planted 3 rows of carrots in bed 1." (Logs to `garden_log.md` and `carrots.md`)
-
-*   **Manual Briefing**
-    *   Type `!briefing` in the reminders channel to trigger the daily report immediately.
-
-*   **Evening Debrief**
-    *   Type `!debrief` in the journal channel to trigger the debrief prompt.
-    *   Click the "Log Today's Debrief" button, fill in the modal, and submit.
-
-*   **Consolidate Knowledge**
-    *   `!consolidate` — Semantically categorize your entire knowledge library using the LLM. Groups files by type (Trees, Herbs, Vegetables, etc.), identifies merge candidates, and saves results to `categories.md`. Ask the bot *"what categories do I have?"* to see them anytime.
-    *   `!consolidate garlic` — Merge all garlic-related files into a single clean `garlic.md`, removing duplicates and `### Update` sections. Backups are created first in `data/backups/`.
-
-*   **Garden Recap**
-    *   `!recap` — Summarize the last 7 days of garden activity (journal entries, harvests, task progress).
-    *   `!recap 14` — Recap the last 14 days (up to 90).
-
-**Knowledge Ingest Channel**
-Paste URLs, upload text files, or type knowledge directly. The bot extracts, chunks, and categorizes it.
+| Variable | Description |
+|---|---|
+| `DISCORD_TOKEN` | Your Discord bot token |
+| `REMINDERS_CHANNEL_ID` | Channel ID for daily briefings and weather alerts |
+| `JOURNAL_CHANNEL_ID` | Channel ID for journal updates and debrief |
+| `QUESTIONS_CHANNEL_ID` | Channel ID for Q&A |
+| `KNOWLEDGE_INGEST_CHANNEL_ID` | Channel ID for knowledge ingestion |
+| `GOOGLE_API_KEY` | Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey) |
+| `GEMINI_MODEL` | Gemini model name (default: `gemini-2.5-flash`) |
+| `OPENWEATHER_API_KEY` | OpenWeatherMap API key |
+| `WEATHER_LAT` | Latitude for weather lookups |
+| `WEATHER_LON` | Longitude for weather lookups |
+| `BOT_TIMEZONE` | IANA timezone (default: `America/Denver`) |
 
 ## Architecture
 
 | Module | Role |
 |---|---|
-| `src/bot.py` | Discord bot — routing, commands (`!briefing`, `!debrief`, `!consolidate`, `!recap`), scheduled loops (daily report, debrief, weather alerts, weekly recap), message parsing, debrief UI (modal + persistent view) |
+| `src/bot.py` | Discord bot — routing, commands (`!briefing`, `!debrief`, `!consolidate`, `!recap`, `!setup`, `!version`), scheduled loops (daily report, debrief, weather alerts, weekly recap), message parsing, debrief UI (modal + persistent view), onboarding flow |
 | `src/graph.py` | LangGraph state machine — agent loop with tools, system prompt, SQLite checkpointer |
 | `src/services/tools.py` | Core logic — file operations, task management, harvest logging, calendar generation, search |
 | `src/services/weather.py` | Standalone async functions for current weather and 48-hour forecast via OpenWeatherMap |
 | `src/services/categorization.py` | Direct LLM calls for semantic file categorization and merge suggestions (used by `!consolidate`) |
 | `data/` | Knowledge library — `tasks.md`, `harvests.md`, `planting_calendar.md`, `garden_log.md`, `categories.md`, and topic files |
 
-## Future Enhancements
+## Commands
 
-> These are ideas for future development.
+- `!briefing` — Trigger the morning briefing manually (reminders or journal channel).
+- `!debrief` — Trigger the evening debrief prompt (journal channel).
+- `!consolidate` — Categorize all knowledge files by type, identify merge candidates, save to `categories.md`.
+- `!consolidate <topic>` — Merge all files related to a topic into a single clean file (with backups).
+- `!recap [days]` — Summarize the last N days of garden activity (default 7, max 90).
+- `!setup` — Start the onboarding flow (walks you through location, garden layout, and orientation via DM).
+- `!version` — Show the current Beanbot version.
 
-- [x] **Conversation history memory** — Implemented via LangGraph `AsyncSqliteSaver` checkpointer. The agent remembers context across messages within a thread.
+## How to Use
 
-- [x] **Image/photo understanding** — Upload garden photos for analysis by Gemini's vision capabilities. Identify plants, pests, and diseases. Garden layout photos update `farm_layout.md` automatically.
+**Journal / Reminders / Questions** — Interact naturally in these channels. The agent uses tools to persist your data.
 
-- [x] **Farm layout from drawings** — Upload a photo or sketch of your farm layout. The bot extracts spatial info (beds, rows, plantings) into `farm_layout.md`. Supports iterative updates ("I moved the tomatoes to bed 3").
+*   **Manage Tasks**
+    *   "Remind me to prune the roses on Sunday."
+    *   "What do I have to do today?"
+    *   "I finished the pruning task."
 
-- [x] **PDF ingestion** — Upload PDFs (seed catalogs, extension service guides, soil reports) to the knowledge-ingest channel. Text extracted via `pymupdf`, then run through the chunking and LLM ingestion pipeline.
+*   **Track Harvests**
+    *   "Harvested 3 lbs of beans from Bed 2."
+    *   "Log a harvest of 10 zucchini."
 
-- [x] **Semantic knowledge categorization** — `!consolidate` uses batched direct LLM calls to categorize the entire knowledge library by plant type and topic, identify merge candidates, and save results to `categories.md`.
+*   **Consult Calendar**
+    *   "When should I plant garlic?"
+    *   "Generate a planting calendar."
 
-- [x] **Proactive weather alerts** — 48-hour forecast integration with frost and rain alerts every 6 hours. Morning briefing includes forecast-based watering and frost protection advice.
+*   **Log Updates**
+    *   "Planted 3 rows of carrots in bed 1."
 
-- [x] **Weekly recap** — Automatic Sunday evening recap summarizing the week's activities, harvests, and task progress. Also available on-demand via `!recap [days]`.
+**Knowledge Ingest Channel** — Paste URLs, upload text/PDF files, or type knowledge directly. The bot extracts, chunks, and categorizes it.
 
-- [ ] **Onboarding flow** — First-time setup wizard via DM: the bot asks for your location, hardiness zone, what you're growing, and farm size, then auto-creates initial knowledge files (`almanac.md`, `farm_layout.md`) from your responses.
+## Running Locally
+
+Requires Python 3.12+.
+
+```bash
+uv sync
+python -m src.bot
+```
+
+## Releasing
+
+This project uses [bump-my-version](https://github.com/callowayproject/bump-my-version) for version management.
+
+```bash
+# Install dev dependencies
+uv sync --extra dev
+
+# Bump version (creates commit + tag)
+bump-my-version bump patch   # 1.0.0 → 1.0.1
+bump-my-version bump minor   # 1.0.0 → 1.1.0
+bump-my-version bump major   # 1.0.0 → 2.0.0
+```
+
+This updates `pyproject.toml` and `CHANGELOG.md`, creates a git commit, and tags it.

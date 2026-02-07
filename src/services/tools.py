@@ -30,6 +30,11 @@ def _list_md_paths(exclude_system: bool = True, exclude_daily: bool = True) -> l
     return result
 
 
+def is_onboarding_complete() -> bool:
+    """Check if onboarding is complete (almanac.md exists)."""
+    return os.path.exists(os.path.join(DATA_DIR, "almanac.md"))
+
+
 def list_knowledge_files() -> str:
     """
     Lists all available markdown files in the data directory.

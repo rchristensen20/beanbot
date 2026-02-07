@@ -5,7 +5,7 @@ from typing import List, TypedDict, Annotated
 from langgraph.graph.message import add_messages
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage
 from langchain_core.tools import tool
-from langchain_google_vertexai import ChatVertexAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -147,14 +147,13 @@ class AgentState(TypedDict):
 # --- Node Logic ---
 
 def get_model():
-    return ChatVertexAI(
-        model_name=os.getenv("VERTEX_MODEL", "gemini-2.5-flash"),
-        location=os.getenv("GCP_LOCATION", "us-central1"),
+    return ChatGoogleGenerativeAI(
+        model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
         temperature=0
     ).bind_tools(TOOLS)
 
 STATIC_SYSTEM_PROMPT = (
-    "You are Farmbot, a gardening assistant.\n"
+    "You are Beanbot, a gardening assistant.\n"
     "You have access to a knowledge library, but you must read the files to see their content.\n"
     "TOOLS:\n"
     "- 'tool_read_file': Read content.\n"

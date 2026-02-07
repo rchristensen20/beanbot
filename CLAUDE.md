@@ -2,12 +2,12 @@
 
 ## Project Overview
 
-Farmbot is a personal gardening assistant Discord bot for a small farm in Colorado (Zone 5b, Mountain Time). It uses a LangGraph agentic workflow backed by Google Vertex AI (Gemini) to manage a markdown-based knowledge library, task list, harvest log, and garden journal.
+Beanbot is a personal gardening assistant Discord bot. It uses a LangGraph agentic workflow backed by the Google Gemini API to manage a markdown-based knowledge library, task list, harvest log, and garden journal.
 
 ## Tech Stack
 
-- **Python 3.13** with discord.py, LangGraph, langchain-google-vertexai, pymupdf
-- **Google Vertex AI** (Gemini 2.5 Flash) for LLM inference
+- **Python 3.13** with discord.py, LangGraph, langchain-google-genai, pymupdf
+- **Google Gemini API** (Gemini 2.5 Flash) for LLM inference
 - **LangGraph** state machine with tool-calling loop and SQLite checkpointer for conversation memory
 - **Docker** for deployment (single container, `docker-compose up`)
 
@@ -45,27 +45,28 @@ data/                           → Markdown knowledge library (auto-managed by 
 - `!consolidate <topic>` — Find all files related to a topic, back them up, merge/deduplicate into a single clean file, and delete merged sub-files (questions, reminders, or journal channel)
 - `!consolidate` (no args) — LLM-based semantic categorization: sends all filenames to Gemini in batches, groups them by plant type (Trees, Herbs, Vegetables, etc.), identifies merge candidates, saves results to `categories.md`, and posts a summary to Discord. Falls back to prefix-based grouping on LLM failure.
 - `!recap [days]` — Generate a recap of the last N days (default 7, max 90) of garden activity. Summarizes journal entries, harvests, and task progress. Works in reminders, journal, or questions channel.
+- `!setup` — Start onboarding flow. Redirects to DMs if called from a channel. Walks user through location/zone, garden layout, knowledge building, and channel orientation. Skips if already complete.
+- `!version` — Show the current Beanbot version (parsed from `pyproject.toml` at import time).
 
 ## Scheduled Tasks
 
-- **8:00 AM MT** — `daily_report`: morning briefing with current weather, 48-hour forecast, tasks, planting calendar → reminders channel. Includes frost/rain-based watering and protection advice.
-- **8:00 PM MT** — `daily_debrief`: evening debrief prompt with open tasks + button → journal channel
+- **8:00 AM** — `daily_report`: morning briefing with current weather, 48-hour forecast, tasks, planting calendar → reminders channel. Includes frost/rain-based watering and protection advice.
+- **8:00 PM** — `daily_debrief`: evening debrief prompt with open tasks + button → journal channel
 - **Every 6 hours** — `weather_alerts`: checks 48-hour forecast for frost (≤ 2°C) or significant rain (≥ 60% chance or ≥ 10mm). Posts alert to reminders channel, max once per day (deduped via `data/.alert_flag`).
-- **Sunday 8:00 PM MT** — `weekly_recap`: automatic 7-day garden recap → reminders channel
+- **Sunday 8:00 PM** — `weekly_recap`: automatic 7-day garden recap → reminders channel
 
 ## Environment Variables
 
 Required in `.env` (or Docker environment):
 - `DISCORD_TOKEN`, `REMINDERS_CHANNEL_ID`, `JOURNAL_CHANNEL_ID`, `QUESTIONS_CHANNEL_ID`, `KNOWLEDGE_INGEST_CHANNEL_ID`
-- `GCP_PROJECT`, `GCP_LOCATION`, `VERTEX_MODEL`
+- `GOOGLE_API_KEY`, `GEMINI_MODEL`
 - `OPENWEATHER_API_KEY`, `WEATHER_LAT`, `WEATHER_LON`
-
-Google Cloud credentials go in `privatecredentials/credentials.json`.
+- `BOT_TIMEZONE` (optional, default: `America/Denver`)
 
 ## Development
 
 ```bash
-# Run locally (needs .env and credentials)
+# Run locally (needs .env)
 python -m src.bot
 
 # Run with Docker
@@ -89,8 +90,10 @@ docker-compose logs -f
 - All file operations in `tools.py` use `os.path.basename()` to prevent directory traversal.
 - `SYSTEM_FILES` is defined once at the top of `tools.py` and used by `tool_delete_file` (prevents deletion), `_list_md_paths` (excludes from search/calendar/library listings), and `generate_calendar_from_library` (skips during scan).
 - `!consolidate` always backs up files before modifying/deleting. Backups live in `data/backups/`.
-- `categorize_files()` and `suggest_merges()` in `src/services/categorization.py` are direct LLM calls (no agent/tools) using `ChatVertexAI` without `.bind_tools()`. They batch files in groups of ~200 to avoid output token limits.
+- `categorize_files()` and `suggest_merges()` in `src/services/categorization.py` are direct LLM calls (no agent/tools) using `ChatGoogleGenerativeAI` without `.bind_tools()`. They batch files in groups of ~200 to avoid output token limits.
 - `fetch_current_weather()` and `fetch_forecast()` in `src/services/weather.py` are standalone async functions with explicit parameters. Weather threshold constants (`FROST_THRESHOLD_C`, `RAIN_PROB_THRESHOLD_PCT`, `RAIN_MM_THRESHOLD`) are defined there.
 - `_sanitize_topic()` and `_list_md_paths()` in `tools.py` are shared helpers used by multiple tool functions to avoid duplication.
 - `bot.py` constants: `DISCORD_MESSAGE_LIMIT` (2000) and `INGESTION_CHUNK_SIZE` (50,000) control text chunking via `_chunk_text()`. Both `_send_long_reply()` and `run_recap_logic()` delegate to `_chunk_text()`.
 - The system prompt maps "categories" questions to `categories.md` to prevent Gemini from hallucinating file lists from memory.
+- **Onboarding detection**: `is_onboarding_complete()` in `tools.py` checks if `data/almanac.md` exists. When incomplete, DMs route through the `"onboarding"` channel context instead of `"dm"`. The `!setup` command initiates onboarding, redirecting to DMs if called from a channel.
+- **Version**: `_read_version()` in `bot.py` parses version from `pyproject.toml` at import time, cached as `BOT_VERSION`. Use `bump-my-version bump patch|minor|major` to release (updates `pyproject.toml` + `CHANGELOG.md`, creates commit + tag).

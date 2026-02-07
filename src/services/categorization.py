@@ -5,7 +5,7 @@ import logging
 import asyncio
 
 from langchain_core.messages import HumanMessage
-from langchain_google_vertexai import ChatVertexAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 logger = logging.getLogger(__name__)
 
@@ -82,9 +82,8 @@ async def categorize_files(file_entries: list[dict], progress_callback=None) -> 
     Returns:
         dict mapping category names to lists of filenames.
     """
-    model = ChatVertexAI(
-        model_name=os.getenv("VERTEX_MODEL", "gemini-2.5-flash"),
-        location=os.getenv("GCP_LOCATION", "us-central1"),
+    model = ChatGoogleGenerativeAI(
+        model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
         temperature=0,
         max_output_tokens=16384,
     )
@@ -149,9 +148,8 @@ async def suggest_merges(categories: dict[str, list[str]]) -> list[dict]:
         "Only include groups with 2+ files. If no merges needed, return []."
     )
 
-    model = ChatVertexAI(
-        model_name=os.getenv("VERTEX_MODEL", "gemini-2.5-flash"),
-        location=os.getenv("GCP_LOCATION", "us-central1"),
+    model = ChatGoogleGenerativeAI(
+        model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
         temperature=0,
     )
 

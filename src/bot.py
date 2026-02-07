@@ -10,20 +10,40 @@ from zoneinfo import ZoneInfo
 from langchain_core.messages import HumanMessage
 from bs4 import BeautifulSoup
 
+BOT_TZ = ZoneInfo(os.getenv("BOT_TIMEZONE", "America/Denver"))
+
 # Import our new graph
 from src.graph import init_graph
 import src.graph as graph_module
 # Import basic file reader for the daily report
-from src.services.tools import read_knowledge_file, get_open_tasks, find_related_files, search_file_contents, build_library_index, get_library_files
+from src.services.tools import read_knowledge_file, get_open_tasks, find_related_files, search_file_contents, build_library_index, get_library_files, is_onboarding_complete
 from src.services.categorization import categorize_files, suggest_merges
 from src.services.weather import fetch_current_weather, fetch_forecast
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("farmbot")
+logger = logging.getLogger("beanbot")
 
 DISCORD_MESSAGE_LIMIT = 2000
 INGESTION_CHUNK_SIZE = 50_000
+
+
+def _read_version() -> str:
+    """Read the project version from pyproject.toml."""
+    pyproject_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "pyproject.toml")
+    try:
+        with open(pyproject_path) as f:
+            for line in f:
+                if line.strip().startswith("version"):
+                    match = re.search(r'"([^"]+)"', line)
+                    if match:
+                        return match.group(1)
+    except Exception:
+        pass
+    return "unknown"
+
+
+BOT_VERSION = _read_version()
 
 CHANNEL_CONTEXT = {
     "journal": "[CONTEXT: User is posting in the JOURNAL channel. Prioritize logging updates and amending knowledge.]\n\n",
@@ -35,6 +55,32 @@ CHANNEL_CONTEXT = {
         "2. For EACH topic, call tool_amend_knowledge with the topic name and relevant facts\n"
         "3. Be thorough - extract cultivar info, planting dates, care tips, companion plants, etc.\n"
         "4. When done, reply with ONLY a short confirmation (under 500 chars): list the file names updated and a one-line summary. Do NOT repeat the ingested content back.]\n\n"
+    ),
+    "onboarding": (
+        "[CONTEXT: This is a NEW USER ONBOARDING session via DM. Guide them through setup step by step.\n"
+        "Be warm, conversational, and ask ONE topic at a time. Wait for their response before moving on.\n\n"
+        "PHASE 1 — Location & Zone:\n"
+        "- Ask for their city/state or general area\n"
+        "- Determine their USDA hardiness zone and estimated frost dates from the location\n"
+        "- Create 'almanac.md' via tool_overwrite_file with: zone, last/first frost dates, growing season length, and climate notes\n"
+        "- Do NOT create almanac.md until the user confirms their location\n\n"
+        "PHASE 2 — Garden Layout:\n"
+        "- Ask about their garden setup (raised beds, in-ground rows, containers, greenhouse, etc.)\n"
+        "- Create 'farm_layout.md' via tool_overwrite_file from their description\n"
+        "- Let them know they can draw/sketch their garden layout, label it, and upload the photo — the bot will extract spatial info and update farm_layout.md automatically\n\n"
+        "PHASE 3 — Knowledge Building (user-driven, NOT LLM-generated):\n"
+        "- Do NOT generate plant information from your own knowledge\n"
+        "- Explain the knowledge-ingest channel and what they can upload:\n"
+        "  * URLs/articles — paste links to growing guides, extension service pages, seed company info\n"
+        "  * PDFs — upload seed catalogs, planting guides, soil reports\n"
+        "  * Photos — upload garden photos for plant/pest identification, or layout sketches\n"
+        "  * Text — paste notes, tips, or information directly\n"
+        "- Explain that the more they feed it, the smarter the daily briefings and advice become\n\n"
+        "PHASE 4 — Orient to channels & commands:\n"
+        "- Explain each channel: journal (daily updates), questions (Q&A), reminders (briefings/alerts), knowledge-ingest (feed info)\n"
+        "- Mention key commands: !briefing, !debrief, !recap, !consolidate\n"
+        "- Let them know they can always ask questions or add more info anytime\n"
+        "- Welcome them warmly and let them know setup is complete!]\n\n"
     ),
 }
 
@@ -70,7 +116,7 @@ class DebriefModal(discord.ui.Modal, title="Daily Garden Debrief"):
         required=False,
     )
 
-    def __init__(self, bot: "FarmBot"):
+    def __init__(self, bot: "BeanBot"):
         super().__init__()
         self.bot = bot
 
@@ -113,7 +159,7 @@ class DebriefModal(discord.ui.Modal, title="Daily Garden Debrief"):
 
 
 class DebriefView(discord.ui.View):
-    def __init__(self, bot: "FarmBot"):
+    def __init__(self, bot: "BeanBot"):
         super().__init__(timeout=None)
         self.bot = bot
 
@@ -126,7 +172,7 @@ class DebriefView(discord.ui.View):
         await interaction.response.send_modal(DebriefModal(self.bot))
 
 
-class FarmBot(commands.Bot):
+class BeanBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
@@ -159,6 +205,14 @@ class FarmBot(commands.Bot):
         async def recap_cmd(ctx, days: int = 7):
             await self.recap(ctx, days)
 
+        @self.command(name="setup")
+        async def setup_cmd(ctx):
+            await self.setup_onboarding(ctx)
+
+        @self.command(name="version")
+        async def version_cmd(ctx):
+            await ctx.send(f"Beanbot v{BOT_VERSION}")
+
     async def setup_hook(self):
         await init_graph()
         logger.info("Conversation memory initialized.")
@@ -167,7 +221,7 @@ class FarmBot(commands.Bot):
         self.daily_debrief.start()
         self.weather_alerts.start()
         self.weekly_recap.start()
-        logger.info("FarmBot setup complete. All schedulers started.")
+        logger.info("BeanBot setup complete. All schedulers started.")
 
     async def on_ready(self):
         logger.info(f"Logged in as {self.user} (ID: {self.user.id})")
@@ -338,6 +392,8 @@ class FarmBot(commands.Bot):
                     channel_type = "dm"
                     if is_journal: channel_type = "journal"
                     elif is_question: channel_type = "questions"
+                    elif is_dm and not is_onboarding_complete():
+                        channel_type = "onboarding"
 
                     response = await self.process_llm_request(content, channel_type, thread_id=str(message.channel.id), images=image_data)
                     await self._send_long_reply(message, response)
@@ -411,7 +467,7 @@ class FarmBot(commands.Bot):
             logger.error(f"Error in LangGraph execution: {e}", exc_info=True)
             return "I encountered an error processing your request."
 
-    @tasks.loop(time=time(hour=8, minute=0, tzinfo=ZoneInfo("America/Denver")))
+    @tasks.loop(time=time(hour=8, minute=0, tzinfo=BOT_TZ))
     async def daily_report(self):
         if self.reminders_channel_id == 0:
             return
@@ -497,6 +553,24 @@ class FarmBot(commands.Bot):
             return
 
         await self.run_daily_debrief_logic(ctx.channel)
+
+    async def setup_onboarding(self, ctx):
+        """Start the onboarding flow via DM."""
+        if is_onboarding_complete():
+            await ctx.send("Setup is already complete! Your almanac and garden layout are configured. "
+                           "You can update them anytime by chatting with me in the questions channel or DMs.")
+            return
+
+        if not isinstance(ctx.channel, discord.DMChannel):
+            # Called from a server channel — redirect to DMs
+            await ctx.send("Check your DMs — I'll walk you through setup there!")
+            dm_channel = await ctx.author.create_dm()
+        else:
+            dm_channel = ctx.channel
+
+        prompt = "Hi! I'm Beanbot, your personal gardening assistant. Let's get you set up! First — what city or area are you located in? This helps me determine your hardiness zone and frost dates."
+        response = await self.process_llm_request(prompt, "onboarding", thread_id=str(dm_channel.id))
+        await dm_channel.send(response)
 
     async def consolidate(self, ctx, topic: str):
         """Consolidate knowledge files — single topic or full report."""
@@ -681,7 +755,7 @@ class FarmBot(commands.Bot):
 
         await channel.send(msg, view=DebriefView(self))
 
-    @tasks.loop(time=time(hour=20, minute=0, tzinfo=ZoneInfo("America/Denver")))
+    @tasks.loop(time=time(hour=20, minute=0, tzinfo=BOT_TZ))
     async def daily_debrief(self):
         if self.journal_channel_id == 0:
             return
@@ -791,10 +865,10 @@ class FarmBot(commands.Bot):
             for chunk in chunks[1:]:
                 await channel.send(chunk)
 
-    @tasks.loop(time=time(hour=20, minute=0, tzinfo=ZoneInfo("America/Denver")))
+    @tasks.loop(time=time(hour=20, minute=0, tzinfo=BOT_TZ))
     async def weekly_recap(self):
         """Post a weekly recap every Sunday at 8pm MT."""
-        now = datetime.now(ZoneInfo("America/Denver"))
+        now = datetime.now(BOT_TZ)
         if now.weekday() != 6:  # 6 = Sunday
             return
 
@@ -821,5 +895,5 @@ if __name__ == "__main__":
     if not token:
         raise ValueError("DISCORD_TOKEN not found in environment variables.")
         
-    bot = FarmBot()
+    bot = BeanBot()
     bot.run(token, log_handler=None)

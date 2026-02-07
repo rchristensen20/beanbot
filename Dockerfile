@@ -19,8 +19,8 @@ COPY src src
 # --frozen: Use exact versions from the lock file
 RUN uv sync --frozen
 
-# Copy remaining data
-COPY data data
+# Create data directory (populated at runtime via volume mount or bot usage)
+RUN mkdir -p data
 
 # Command to run the bot
 CMD ["python", "src/bot.py"]
