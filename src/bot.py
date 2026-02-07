@@ -1,0 +1,944 @@
+import discord
+from discord.ext import commands, tasks
+import os
+import re
+import logging
+import base64
+import httpx
+from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
+from langchain_core.messages import HumanMessage
+from bs4 import BeautifulSoup
+
+# Import our new graph
+from src.graph import init_graph
+import src.graph as graph_module
+# Import basic file reader for the daily report
+from src.services.tools import read_knowledge_file, get_open_tasks, find_related_files, search_file_contents, build_library_index, get_library_files
+from src.graph import categorize_files, suggest_merges
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("ryanbot")
+
+class DebriefModal(discord.ui.Modal, title="Daily Garden Debrief"):
+    activities = discord.ui.TextInput(
+        label="Activities",
+        placeholder="What you did today (planting, weeding, watering, etc.)",
+        style=discord.TextStyle.paragraph,
+        required=False,
+    )
+    harvests = discord.ui.TextInput(
+        label="Harvests",
+        placeholder="What you harvested (crop, amount, location)",
+        style=discord.TextStyle.paragraph,
+        required=False,
+    )
+    pest_disease = discord.ui.TextInput(
+        label="Pest/Disease",
+        placeholder="Any pest sightings, disease, or problems",
+        style=discord.TextStyle.paragraph,
+        required=False,
+    )
+    observations = discord.ui.TextInput(
+        label="Observations",
+        placeholder="General notes (weather, soil, growth, etc.)",
+        style=discord.TextStyle.paragraph,
+        required=False,
+    )
+    task_updates = discord.ui.TextInput(
+        label="Task Updates",
+        placeholder="Status of open tasks (completed, deferred, notes)",
+        style=discord.TextStyle.paragraph,
+        required=False,
+    )
+
+    def __init__(self, bot: "RyanBot"):
+        super().__init__()
+        self.bot = bot
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(thinking=True)
+
+        today = date.today().isoformat()
+        sections = []
+        if self.activities.value:
+            sections.append(f"**Activities:** {self.activities.value}")
+        if self.harvests.value:
+            sections.append(f"**Harvests:** {self.harvests.value}")
+        if self.pest_disease.value:
+            sections.append(f"**Pest/Disease:** {self.pest_disease.value}")
+        if self.observations.value:
+            sections.append(f"**Observations:** {self.observations.value}")
+        if self.task_updates.value:
+            sections.append(f"**Task Updates:** {self.task_updates.value}")
+
+        if not sections:
+            await interaction.followup.send("No data entered — debrief skipped.")
+            return
+
+        debrief_text = "\n".join(sections)
+        prompt = (
+            f"[CONTEXT: This is an EVENING DEBRIEF submission for {today}. "
+            f"Process the following structured debrief data. Use your tools to:\n"
+            f"1. Log activities to garden_log.md via tool_update_journal\n"
+            f"2. Log any harvests to harvests.md via tool_log_harvest\n"
+            f"3. Mark completed tasks via tool_complete_task\n"
+            f"4. Amend knowledge if pest/disease/observation info is noteworthy\n"
+            f"After processing, reply with a short confirmation summary of what was logged.]\n\n"
+            f"{debrief_text}"
+        )
+
+        response = await self.bot.process_llm_request(
+            prompt, "journal", thread_id=f"debrief_{today}"
+        )
+        await interaction.followup.send(f"**Debrief logged!**\n{response}")
+
+
+class DebriefView(discord.ui.View):
+    def __init__(self, bot: "RyanBot"):
+        super().__init__(timeout=None)
+        self.bot = bot
+
+    @discord.ui.button(
+        label="Log Today's Debrief",
+        style=discord.ButtonStyle.primary,
+        custom_id="debrief_button",
+    )
+    async def debrief_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(DebriefModal(self.bot))
+
+
+class RyanBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        super().__init__(command_prefix="!", intents=intents)
+        
+        # Channel IDs
+        self.reminders_channel_id = int(os.getenv("REMINDERS_CHANNEL_ID", "0"))
+        self.journal_channel_id = int(os.getenv("JOURNAL_CHANNEL_ID", "0"))
+        self.questions_channel_id = int(os.getenv("QUESTIONS_CHANNEL_ID", "0"))
+        self.knowledge_ingest_channel_id = int(os.getenv("KNOWLEDGE_INGEST_CHANNEL_ID", "0"))
+        
+        self.weather_api_key = os.getenv("OPENWEATHER_API_KEY")
+        self.weather_lat = os.getenv("WEATHER_LAT")
+        self.weather_lon = os.getenv("WEATHER_LON")
+        
+        # Register commands
+        @self.command(name="briefing")
+        async def briefing_cmd(ctx):
+             await self.briefing(ctx)
+
+        @self.command(name="debrief")
+        async def debrief_cmd(ctx):
+            await self.debrief(ctx)
+
+        @self.command(name="consolidate")
+        async def consolidate_cmd(ctx, *, topic: str = ""):
+            await self.consolidate(ctx, topic.strip())
+
+        @self.command(name="recap")
+        async def recap_cmd(ctx, days: int = 7):
+            await self.recap(ctx, days)
+
+    async def setup_hook(self):
+        await init_graph()
+        logger.info("Conversation memory initialized.")
+        self.add_view(DebriefView(self))
+        self.daily_report.start()
+        self.daily_debrief.start()
+        self.weather_alerts.start()
+        self.weekly_recap.start()
+        logger.info("RyanBot setup complete. All schedulers started.")
+
+    async def on_ready(self):
+        logger.info(f"Logged in as {self.user} (ID: {self.user.id})")
+
+    def _extract_urls(self, text: str) -> list[str]:
+        """Extract URLs from message text."""
+        url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
+        return re.findall(url_pattern, text)
+
+    async def _fetch_url_content(self, url: str) -> str:
+        """Fetch and extract text from URL."""
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        async with httpx.AsyncClient(timeout=30.0, headers=headers) as client:
+            try:
+                resp = await client.get(url, follow_redirects=True)
+                resp.raise_for_status()
+                content_type = resp.headers.get('content-type', '')
+
+                if 'text/html' in content_type:
+                    soup = BeautifulSoup(resp.text, 'html.parser')
+                    # Remove scripts, styles, nav, footer
+                    for tag in soup(['script', 'style', 'nav', 'footer', 'header']):
+                        tag.decompose()
+                    return soup.get_text(separator='\n', strip=True)
+                elif 'text/' in content_type or url.endswith(('.md', '.txt')):
+                    return resp.text
+                else:
+                    return f"[Unsupported content type: {content_type}]"
+            except Exception as e:
+                logger.error(f"Failed to fetch {url}: {e}")
+                return f"[Error fetching URL: {e}]"
+
+    @staticmethod
+    def _extract_pdf_text(pdf_bytes: bytes, filename: str) -> str:
+        """Extract text content from PDF bytes."""
+        import pymupdf
+        try:
+            doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+            pages = [page.get_text() for page in doc]
+            doc.close()
+            return "\n\n".join(pages)
+        except Exception as e:
+            logger.error(f"Failed to extract text from PDF {filename}: {e}")
+            return ""
+
+    @staticmethod
+    def _chunk_text(text: str, max_size: int = 50000) -> list[str]:
+        """Split text into chunks at natural boundaries."""
+        if len(text) <= max_size:
+            return [text]
+
+        chunks = []
+        while text:
+            if len(text) <= max_size:
+                chunks.append(text)
+                break
+
+            # Try to split at double newline
+            split_at = text.rfind('\n\n', 0, max_size)
+            if split_at < max_size // 2:
+                # Try single newline
+                split_at = text.rfind('\n', 0, max_size)
+            if split_at < max_size // 2:
+                # Try space
+                split_at = text.rfind(' ', 0, max_size)
+            if split_at < max_size // 2:
+                # Hard cut
+                split_at = max_size
+
+            chunks.append(text[:split_at])
+            text = text[split_at:].lstrip('\n')
+
+        return chunks
+
+    async def _send_long_reply(self, message: discord.Message, response: str):
+        """Send a reply, splitting into multiple messages if over Discord's 2000 char limit."""
+        if len(response) <= 2000:
+            await message.reply(response)
+            return
+
+        chunks = []
+        while response:
+            if len(response) <= 2000:
+                chunks.append(response)
+                break
+            split_at = response.rfind('\n', 0, 2000)
+            if split_at < 1000:
+                split_at = response.rfind(' ', 0, 2000)
+            if split_at < 1000:
+                split_at = 2000
+            chunks.append(response[:split_at])
+            response = response[split_at:].lstrip('\n')
+
+        await message.reply(chunks[0])
+        for chunk in chunks[1:]:
+            await message.channel.send(chunk)
+
+    async def on_message(self, message):
+        if message.author == self.user:
+            return
+
+        # Check if message is in one of our designated channels
+        is_journal = message.channel.id == self.journal_channel_id
+        is_question = message.channel.id == self.questions_channel_id
+        is_ingest = message.channel.id == self.knowledge_ingest_channel_id
+        is_dm = isinstance(message.channel, discord.DMChannel)
+        is_mention = self.user in message.mentions
+
+        # Handle knowledge ingestion channel
+        if is_ingest:
+            async with message.channel.typing():
+                # Extract image attachments separately
+                image_data = await self._extract_images(message)
+                non_image_attachments = [
+                    att for att in message.attachments
+                    if not (att.content_type and att.content_type.startswith("image/"))
+                ]
+
+                # Extract PDF attachments
+                pdf_texts = []
+                other_attachments = []
+                for att in non_image_attachments:
+                    if (att.content_type and "pdf" in att.content_type) or att.filename.lower().endswith(".pdf"):
+                        pdf_bytes = await att.read()
+                        text = self._extract_pdf_text(pdf_bytes, att.filename)
+                        if text:
+                            pdf_texts.append(f"--- Content from {att.filename} ---\n{text}")
+                    else:
+                        other_attachments.append(att)
+
+                # Collect URLs from message text
+                urls = self._extract_urls(message.content)
+                # Add non-image, non-PDF attachment URLs
+                urls.extend([att.url for att in other_attachments])
+
+                if urls:
+                    # Fetch URL content
+                    contents = []
+                    for url in urls[:5]:
+                        content = await self._fetch_url_content(url)
+                        contents.append(f"--- Content from {url} ---\n{content}")
+                    combined = "\n\n".join(pdf_texts + contents)
+                elif message.content.strip() or image_data or pdf_texts:
+                    # Plain text message, images, and/or PDF content
+                    parts = pdf_texts + [message.content or ""]
+                    combined = "\n\n".join(parts).strip()
+                else:
+                    await message.reply("Send a URL, upload a file, or type knowledge to ingest.")
+                    return
+
+                chunks = self._chunk_text(combined) if combined.strip() else [combined]
+
+                if len(chunks) == 1:
+                    response = await self.process_llm_request(chunks[0], "knowledge_ingest", thread_id=str(message.channel.id), images=image_data)
+                    await self._send_long_reply(message, response)
+                else:
+                    total = len(chunks)
+                    progress_msg = await message.reply(f"Ingesting large content in {total} parts...")
+                    responses = []
+                    for i, chunk in enumerate(chunks, 1):
+                        # Only pass images with the first chunk
+                        chunk_images = image_data if i == 1 else []
+                        response = await self.process_llm_request(chunk, "knowledge_ingest", thread_id=str(message.channel.id), images=chunk_images)
+                        responses.append(response)
+                        await progress_msg.edit(content=f"Processed {i}/{total} parts...")
+                    await progress_msg.edit(content=f"Done! Ingested {total} parts.")
+                    summary = "\n".join(responses)
+                    await self._send_long_reply(message, summary)
+            return
+
+        if is_journal or is_question or is_dm or is_mention:
+            # Process as conversational LLM request ONLY if it is not a command
+            ctx = await self.get_context(message)
+            if not ctx.valid:
+                async with message.channel.typing():
+                    content = message.content.replace(f"<@{self.user.id}>", "").strip()
+
+                    # Extract image attachments
+                    image_data = await self._extract_images(message)
+
+                    # Determine "context" based on channel
+                    channel_type = "dm"
+                    if is_journal: channel_type = "journal"
+                    elif is_question: channel_type = "questions"
+
+                    response = await self.process_llm_request(content, channel_type, thread_id=str(message.channel.id), images=image_data)
+                    await self._send_long_reply(message, response)
+        
+        await self.process_commands(message)
+
+    async def briefing(self, ctx):
+        """Manually trigger the daily briefing."""
+        if ctx.channel.id not in [self.reminders_channel_id, self.journal_channel_id]:
+            await ctx.send("This command can only be used in the reminders or journal channel.")
+            return
+
+        await ctx.send("Triggering daily briefing manually...")
+        await self.run_daily_report_logic(ctx.channel)
+
+
+    def _extract_text(self, content) -> str:
+        """Extract plain text from message content (handles Gemini's list format)."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            # Gemini returns [{'type': 'text', 'text': '...', ...}]
+            texts = [block.get('text', '') for block in content if isinstance(block, dict) and block.get('type') == 'text']
+            return ''.join(texts)
+        return str(content)
+
+    async def _fetch_weather(self) -> str:
+        if not all([self.weather_api_key, self.weather_lat, self.weather_lon]):
+            return "Weather configuration missing."
+
+        url = "https://api.openweathermap.org/data/2.5/weather"
+        params = {
+            "lat": self.weather_lat,
+            "lon": self.weather_lon,
+            "appid": self.weather_api_key,
+            "units": "metric"
+        }
+
+        async with httpx.AsyncClient() as client:
+            try:
+                resp = await client.get(url, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+                weather_desc = data.get("weather", [{}])[0].get("description", "unknown")
+                temp = data.get("main", {}).get("temp", "unknown")
+                return f"Current Weather: {weather_desc}, Temperature: {temp}°C"
+            except Exception as e:
+                logger.error(f"Failed to fetch weather: {e}")
+                return "Could not fetch weather data."
+
+    async def _fetch_forecast(self) -> dict:
+        """Fetch 48-hour forecast from OpenWeatherMap (5-day/3-hour endpoint).
+
+        Returns dict with:
+          summary: human-readable forecast string
+          frost_risk: bool (any temp <= 2°C)
+          rain_alert: bool (>= 60% chance or >= 10mm total)
+          min_temp_c: float
+          max_rain_mm: float
+          max_rain_prob: float
+        """
+        if not all([self.weather_api_key, self.weather_lat, self.weather_lon]):
+            return {"summary": "Forecast configuration missing.", "frost_risk": False, "rain_alert": False}
+
+        url = "https://api.openweathermap.org/data/2.5/forecast"
+        params = {
+            "lat": self.weather_lat,
+            "lon": self.weather_lon,
+            "appid": self.weather_api_key,
+            "units": "metric",
+            "cnt": 16,  # 16 x 3hr = 48 hours
+        }
+
+        async with httpx.AsyncClient() as client:
+            try:
+                resp = await client.get(url, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+
+                entries = data.get("list", [])
+                if not entries:
+                    return {"summary": "No forecast data available.", "frost_risk": False, "rain_alert": False}
+
+                min_temp = min(e.get("main", {}).get("temp_min", 99) for e in entries)
+                max_temp = max(e.get("main", {}).get("temp_max", -99) for e in entries)
+                max_rain_prob = max(e.get("pop", 0) for e in entries) * 100  # pop is 0-1
+                total_precip = sum(
+                    e.get("rain", {}).get("3h", 0) + e.get("snow", {}).get("3h", 0)
+                    for e in entries
+                )
+
+                frost_risk = min_temp <= 2
+                rain_alert = max_rain_prob >= 60 or total_precip >= 10
+
+                parts = [f"48-Hour Forecast: Low {min_temp:.0f}°C / High {max_temp:.0f}°C"]
+                if max_rain_prob > 0:
+                    parts.append(f"Rain chance up to {max_rain_prob:.0f}%, total precip {total_precip:.1f}mm")
+                if frost_risk:
+                    parts.append(f"⚠ FROST RISK — temps dropping to {min_temp:.0f}°C")
+                if rain_alert:
+                    parts.append("🌧 Significant rain expected")
+
+                return {
+                    "summary": ". ".join(parts),
+                    "frost_risk": frost_risk,
+                    "rain_alert": rain_alert,
+                    "min_temp_c": min_temp,
+                    "max_rain_mm": total_precip,
+                    "max_rain_prob": max_rain_prob,
+                }
+            except Exception as e:
+                logger.error(f"Failed to fetch forecast: {e}")
+                return {"summary": "Could not fetch forecast data.", "frost_risk": False, "rain_alert": False}
+
+    async def _extract_images(self, message: discord.Message) -> list[dict]:
+        """Extract image attachments from a Discord message as bytes with metadata."""
+        image_data = []
+        for att in message.attachments:
+            if att.content_type and att.content_type.startswith("image/"):
+                try:
+                    img_bytes = await att.read()
+                    image_data.append({
+                        "bytes": img_bytes,
+                        "mime_type": att.content_type,
+                        "filename": att.filename,
+                    })
+                except Exception as e:
+                    logger.error(f"Failed to read image attachment {att.filename}: {e}")
+        return image_data
+
+    async def process_llm_request(self, user_input: str, channel_type: str, thread_id: str = "", images: list[dict] | None = None) -> str:
+        """
+        Passes the user input into the LangGraph workflow with channel-specific context.
+        Uses thread_id for conversation memory via the SqliteSaver checkpointer.
+        """
+        # Build channel-specific guidance and fold it into the HumanMessage
+        # (not a separate SystemMessage) to prevent old guidance from accumulating
+        # in the checkpoint history.
+        guidance = ""
+        if channel_type == "journal":
+            guidance = "[CONTEXT: User is posting in the JOURNAL channel. Prioritize logging updates and amending knowledge.]\n\n"
+        elif channel_type == "questions":
+            guidance = "[CONTEXT: User is posting in the QUESTIONS channel. You MUST use tools to retrieve info before answering.]\n\n"
+        elif channel_type == "knowledge_ingest":
+            guidance = (
+                "[CONTEXT: User is posting content to INGEST into the knowledge library.\n"
+                "Your job:\n"
+                "1. Identify all gardening/permaculture topics mentioned (plant names, techniques, etc.)\n"
+                "2. For EACH topic, call tool_amend_knowledge with the topic name and relevant facts\n"
+                "3. Be thorough - extract cultivar info, planting dates, care tips, companion plants, etc.\n"
+                "4. When done, reply with ONLY a short confirmation (under 500 chars): list the file names updated and a one-line summary. Do NOT repeat the ingested content back.]\n\n"
+            )
+
+        if images:
+            content_parts = [{"type": "text", "text": guidance + user_input}]
+            for img in images:
+                b64 = base64.b64encode(img["bytes"]).decode("utf-8")
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{img['mime_type']};base64,{b64}"},
+                })
+            inputs = {"messages": [HumanMessage(content=content_parts)]}
+        else:
+            inputs = {"messages": [HumanMessage(content=guidance + user_input)]}
+
+        config = {"configurable": {"thread_id": thread_id}} if thread_id else {}
+
+        try:
+            result = await graph_module.app_graph.ainvoke(inputs, config=config)
+            final_message = result["messages"][-1]
+            return self._extract_text(final_message.content)
+        except Exception as e:
+            logger.error(f"Error in LangGraph execution: {e}", exc_info=True)
+            return "I encountered an error processing your request."
+
+    @tasks.loop(time=time(hour=8, minute=0, tzinfo=ZoneInfo("America/Denver")))
+    async def daily_report(self):
+        if self.reminders_channel_id == 0:
+            return
+
+        channel = self.get_channel(self.reminders_channel_id)
+        if not channel:
+            logger.warning(f"Reminders channel {self.reminders_channel_id} not found.")
+            return
+
+        await self.run_daily_report_logic(channel)
+
+    async def run_daily_report_logic(self, channel):
+        logger.info("Generating daily report...")
+
+        # Pre-read knowledge files directly
+        weather_data = await self._fetch_weather()
+        forecast = await self._fetch_forecast()
+
+        today = date.today().isoformat()
+
+        # Build forecast guidance for the LLM
+        forecast_guidance = ""
+        if forecast.get("rain_alert"):
+            forecast_guidance += "- Rain is expected in the next 48 hours. Mention that watering may not be needed.\n"
+        if forecast.get("frost_risk"):
+            forecast_guidance += "- Frost is expected! Suggest covering sensitive plants and bringing in any tender seedlings.\n"
+
+        prompt = (
+            f"Generate the daily morning briefing.\n"
+            f"Today's Date: {today}\n"
+            f"Current Weather: {weather_data}\n"
+            f"Forecast: {forecast['summary']}\n\n"
+            "INSTRUCTION: Read the 'garden_log.md', 'tasks.md', 'planting_calendar.md', and 'almanac.md' files using your tools.\n"
+            "Analyze the information to identify:\n"
+            "1. Urgent tasks due today/soon (from tasks.md)\n"
+            "2. Planting actions based on weather/season (from planting_calendar.md)\n"
+            "3. Recent log context (from garden_log.md)\n"
+            "4. Weather-based advice based on the forecast\n"
+        )
+        if forecast_guidance:
+            prompt += f"\nWEATHER NOTES:\n{forecast_guidance}\n"
+        prompt += "If nothing is urgent, respond with exactly 'NO_ACTION'."
+
+        inputs = {"messages": [HumanMessage(content=prompt)]}
+        ephemeral_thread_id = f"daily_report_{today}"
+        config = {"configurable": {"thread_id": ephemeral_thread_id}}
+        try:
+            result = await graph_module.app_graph.ainvoke(inputs, config=config)
+            response = self._extract_text(result["messages"][-1].content)
+
+            # Write weather + forecast + briefing to daily file for tool access
+            daily_path = os.path.join("data", f"daily_{today}.md")
+            daily_content = (
+                f"# Daily Report — {today}\n\n"
+                f"## Weather\n{weather_data}\n\n"
+                f"## Forecast\n{forecast['summary']}\n\n"
+                f"## Briefing\n{response}\n"
+            )
+            try:
+                with open(daily_path, "w") as f:
+                    f.write(daily_content)
+                logger.info(f"Wrote daily file: {daily_path}")
+            except Exception as e:
+                logger.error(f"Failed to write daily file: {e}")
+
+            if "NO_ACTION" not in response:
+                await channel.send(f"**Morning Briefing:**\n{response}")
+            elif "Triggering daily briefing manually" in str(channel): # Just in case we are manual triggering and want feedback even if no action
+                 # Actually channel is a channel object, not string. 
+                 # If triggered manually, the user already saw "Triggering..." message.
+                 # If "NO_ACTION", maybe we should tell the manual user "No action".
+                 pass
+                 
+        except Exception as e:
+            logger.error(f"Daily report failed: {e}")
+            if channel:
+                await channel.send(f"Error generating briefing: {e}")
+
+    @daily_report.before_loop
+    async def before_daily_report(self):
+        await self.wait_until_ready()
+
+    async def debrief(self, ctx):
+        """Manually trigger the daily debrief."""
+        if ctx.channel.id != self.journal_channel_id:
+            await ctx.send("This command can only be used in the journal channel.")
+            return
+
+        await self.run_daily_debrief_logic(ctx.channel)
+
+    async def consolidate(self, ctx, topic: str):
+        """Consolidate knowledge files — single topic or full report."""
+        allowed = [self.questions_channel_id, self.reminders_channel_id, self.journal_channel_id]
+        if ctx.channel.id not in allowed:
+            await ctx.send("This command can only be used in the questions, reminders, or journal channel.")
+            return
+
+        if topic:
+            await self._consolidate_single(ctx, topic)
+        else:
+            await self._consolidate_full(ctx)
+
+    async def _consolidate_single(self, ctx, topic: str):
+        """Consolidate all files related to a single topic."""
+        async with ctx.channel.typing():
+            # Pre-discover related files by filename and content
+            filename_result = find_related_files(topic)
+            content_matches = search_file_contents(topic)
+
+            # Parse filenames from find_related_files result
+            related_files = []
+            if not filename_result.startswith("No files found"):
+                # Format: "Related files: a.md, b.md"
+                parts = filename_result.split(": ", 1)
+                if len(parts) == 2:
+                    related_files = [f.strip() for f in parts[1].split(",")]
+
+            # Combine and deduplicate
+            all_files = list(dict.fromkeys(related_files + content_matches))
+
+            if not all_files:
+                await ctx.send(f"No files found related to **{topic}**.")
+                return
+
+            file_list = "\n".join(f"- `{f}`" for f in all_files)
+            await ctx.send(f"**Consolidating '{topic}'** — found {len(all_files)} file(s):\n{file_list}\n\nWorking...")
+
+            filenames_str = ", ".join(all_files)
+            prompt = (
+                f"[CONTEXT: KNOWLEDGE CONSOLIDATION for topic '{topic}'.]\n\n"
+                f"The following files are related to '{topic}': {filenames_str}\n\n"
+                f"Your job:\n"
+                f"1. Read ALL of these files using tool_read_multiple_files.\n"
+                f"2. Back up EVERY file using tool_backup_file (one call per file).\n"
+                f"3. Analyze the content. Identify which files are primarily ABOUT '{topic}' vs files that merely mention it.\n"
+                f"4. For files primarily about '{topic}': merge all unique facts into a single clean '{topic}.md' using tool_overwrite_file.\n"
+                f"   - Organize by category (Overview, Planting, Care, Pests, Harvesting, Companion Plants, Notes, etc.)\n"
+                f"   - Remove duplicate information and '### Update YYYY-MM-DD' section headers\n"
+                f"   - Preserve ALL unique facts — only remove true duplicates\n"
+                f"   - Use clean markdown formatting\n"
+                f"5. Delete sub-files that were fully merged into '{topic}.md' using tool_delete_file. Do NOT delete '{topic}.md' itself.\n"
+                f"6. Leave files that merely MENTION '{topic}' alone — do not modify or delete them.\n"
+                f"7. Reply with a summary of what was consolidated, merged, and deleted."
+            )
+
+            today = date.today().isoformat()
+            response = await self.process_llm_request(
+                prompt, "questions", thread_id=f"consolidate_{topic}_{today}"
+            )
+            await self._send_long_reply(ctx.message, response)
+
+    def _format_size(self, size_bytes: int) -> str:
+        """Format byte size as human-readable string."""
+        if size_bytes < 1024:
+            return f"{size_bytes} B"
+        return f"{size_bytes / 1024:.1f} KB"
+
+    def _build_categories_md(self, categories: dict, merge_suggestions: list, size_map: dict) -> str:
+        """Build the categories.md content from categorization results."""
+        today = date.today().isoformat()
+        lines = [f"# Knowledge Library Categories\n", f"*Last updated: {today}*\n"]
+
+        sorted_cats = sorted(
+            categories.items(),
+            key=lambda x: (x[0] == "Uncategorized", x[0])
+        )
+
+        total = sum(len(files) for files in categories.values())
+        lines.append(f"**{total} files** across **{len(categories)} categories**\n")
+
+        for cat_name, cat_files in sorted_cats:
+            sorted_files = sorted(cat_files)
+            file_lines = "\n".join(
+                f"  - {f} ({self._format_size(size_map.get(f, 0))})"
+                for f in sorted_files
+            )
+            section = f"## {cat_name} ({len(cat_files)} files)\n\n{file_lines}"
+
+            cat_merges = [
+                m for m in merge_suggestions
+                if any(f in cat_files for f in m.get("files", []))
+            ]
+            if cat_merges:
+                merge_lines = []
+                for m in cat_merges:
+                    target = m.get("target", m["files"][0])
+                    others = [f for f in m["files"] if f != target]
+                    if others:
+                        merge_lines.append(
+                            f"  - {' + '.join(m['files'])} -> `!consolidate {target.replace('.md', '')}`"
+                        )
+                if merge_lines:
+                    section += "\n\n  **Merge candidates:**\n" + "\n".join(merge_lines)
+
+            lines.append(section)
+
+        return "\n\n".join(lines) + "\n"
+
+    async def _consolidate_full(self, ctx):
+        """Categorize all knowledge files, save to categories.md, and send a summary."""
+        async with ctx.channel.typing():
+            file_entries = get_library_files()
+
+            if not file_entries:
+                await ctx.send("No knowledge files found in the library.")
+                return
+
+            progress_msg = await ctx.send(f"Categorizing {len(file_entries)} knowledge files...")
+
+            async def update_progress(batch_num, total_batches):
+                try:
+                    await progress_msg.edit(content=f"Categorizing {len(file_entries)} files... (batch {batch_num}/{total_batches})")
+                except Exception:
+                    pass
+
+            try:
+                categories = await categorize_files(file_entries, progress_callback=update_progress)
+                size_map = {e["filename"]: e["size_bytes"] for e in file_entries}
+
+                # Get merge suggestions (separate, smaller LLM call)
+                merge_suggestions = await suggest_merges(categories)
+
+                # Save categories.md
+                categories_md = self._build_categories_md(categories, merge_suggestions, size_map)
+                categories_path = os.path.join("data", "categories.md")
+                with open(categories_path, "w") as f:
+                    f.write(categories_md)
+                logger.info(f"Saved categorization to {categories_path}")
+
+                # Build a short Discord summary
+                total = sum(len(files) for files in categories.values())
+                sorted_cats = sorted(
+                    categories.items(),
+                    key=lambda x: (-len(x[1]), x[0])
+                )
+                cat_summary = "\n".join(
+                    f"  **{name}**: {len(files)} files"
+                    for name, files in sorted_cats
+                )
+
+                summary = f"Categorized **{total}** files into **{len(categories)}** categories:\n{cat_summary}\n"
+
+                if merge_suggestions:
+                    merge_lines = []
+                    for m in merge_suggestions[:15]:
+                        target = m.get("target", m["files"][0])
+                        merge_lines.append(
+                            f"  \u2022 {' + '.join(f'`{f}`' for f in m['files'])} \u2192 `!consolidate {target.replace('.md', '')}`"
+                        )
+                    summary += f"\n**Merge candidates** ({len(merge_suggestions)} found):\n" + "\n".join(merge_lines)
+                    if len(merge_suggestions) > 15:
+                        summary += f"\n  *(+{len(merge_suggestions) - 15} more — ask me for the full list)*"
+
+                summary += "\n\nAsk me about any category to see its files (e.g. *\"what's in the Trees category?\"*)."
+                await self._send_long_reply(ctx.message, summary)
+
+            except Exception as e:
+                logger.warning(f"LLM categorization failed: {e}", exc_info=True)
+                await ctx.send(f"Categorization failed: {type(e).__name__}: {e}")
+
+    async def run_daily_debrief_logic(self, channel):
+        """Send the debrief prompt with open tasks and the debrief button."""
+        logger.info("Sending daily debrief prompt...")
+
+        open_tasks = get_open_tasks()
+        if open_tasks:
+            task_list = "\n".join(open_tasks)
+            msg = f"**Evening Debrief — {date.today().isoformat()}**\n\nOpen tasks:\n{task_list}\n\nClick below to log what you did today."
+        else:
+            msg = f"**Evening Debrief — {date.today().isoformat()}**\n\nNo open tasks. Click below to log what you did today."
+
+        await channel.send(msg, view=DebriefView(self))
+
+    @tasks.loop(time=time(hour=20, minute=0, tzinfo=ZoneInfo("America/Denver")))
+    async def daily_debrief(self):
+        if self.journal_channel_id == 0:
+            return
+
+        channel = self.get_channel(self.journal_channel_id)
+        if not channel:
+            logger.warning(f"Journal channel {self.journal_channel_id} not found.")
+            return
+
+        await self.run_daily_debrief_logic(channel)
+
+    @daily_debrief.before_loop
+    async def before_daily_debrief(self):
+        await self.wait_until_ready()
+
+    # --- Weather Alerts (every 6 hours) ---
+
+    @tasks.loop(hours=6)
+    async def weather_alerts(self):
+        if self.reminders_channel_id == 0:
+            return
+
+        channel = self.get_channel(self.reminders_channel_id)
+        if not channel:
+            return
+
+        forecast = await self._fetch_forecast()
+        if not forecast.get("frost_risk") and not forecast.get("rain_alert"):
+            return
+
+        # Deduplicate: max one alert per day via flag file
+        flag_path = os.path.join("data", ".alert_flag")
+        today = date.today().isoformat()
+        try:
+            if os.path.exists(flag_path):
+                with open(flag_path) as f:
+                    if f.read().strip() == today:
+                        return  # Already alerted today
+        except Exception:
+            pass
+
+        # Build alert message
+        parts = ["**⚠ Weather Alert**"]
+        if forecast.get("frost_risk"):
+            parts.append(
+                f"🥶 **Frost risk** — temps dropping to {forecast.get('min_temp_c', '?'):.0f}°C in the next 48 hours. "
+                "Consider covering sensitive plants and bringing in tender seedlings."
+            )
+        if forecast.get("rain_alert"):
+            parts.append(
+                f"🌧 **Rain expected** — up to {forecast.get('max_rain_prob', 0):.0f}% chance, "
+                f"{forecast.get('max_rain_mm', 0):.1f}mm total. You may be able to skip watering."
+            )
+
+        await channel.send("\n".join(parts))
+
+        # Write flag
+        try:
+            os.makedirs(os.path.dirname(flag_path), exist_ok=True)
+            with open(flag_path, "w") as f:
+                f.write(today)
+        except Exception as e:
+            logger.error(f"Failed to write alert flag: {e}")
+
+    @weather_alerts.before_loop
+    async def before_weather_alerts(self):
+        await self.wait_until_ready()
+
+    # --- Recap ---
+
+    async def recap(self, ctx, days: int = 7):
+        """Manually trigger a garden recap for the last N days."""
+        allowed = [self.reminders_channel_id, self.journal_channel_id, self.questions_channel_id]
+        if ctx.channel.id not in allowed:
+            await ctx.send("This command can only be used in the reminders, journal, or questions channel.")
+            return
+
+        days = max(1, min(days, 90))  # clamp to reasonable range
+        await ctx.send(f"Generating {days}-day garden recap...")
+        await self.run_recap_logic(ctx.channel, days, reply_message=ctx.message)
+
+    async def run_recap_logic(self, channel, days: int = 7, reply_message=None):
+        """Generate a recap of recent garden activity."""
+        today = date.today().isoformat()
+        start_date = (date.today() - timedelta(days=days)).isoformat()
+
+        prompt = (
+            f"[CONTEXT: Generate a GARDEN RECAP covering {start_date} to {today} ({days} days).]\n\n"
+            "Read 'garden_log.md', 'harvests.md', and 'tasks.md' using your tools.\n"
+            "Summarize:\n"
+            "1. **Activities**: Key things done in this period (from garden_log.md)\n"
+            "2. **Harvests**: What was harvested and approximate totals (from harvests.md)\n"
+            "3. **Tasks**: Tasks completed vs still open (from tasks.md)\n"
+            "4. **Highlights**: Any notable events, milestones, or concerns\n\n"
+            f"Focus on entries from the last {days} days. Keep the recap concise but informative."
+        )
+
+        ephemeral_thread_id = f"recap_{today}"
+        response = await self.process_llm_request(prompt, "questions", thread_id=ephemeral_thread_id)
+
+        if reply_message:
+            await self._send_long_reply(reply_message, response)
+        else:
+            # For scheduled recaps, send directly to channel
+            if len(response) <= 2000:
+                await channel.send(f"**Weekly Garden Recap ({days} days)**\n{response}")
+            else:
+                await channel.send(f"**Weekly Garden Recap ({days} days)**")
+                chunks = []
+                while response:
+                    if len(response) <= 2000:
+                        chunks.append(response)
+                        break
+                    split_at = response.rfind('\n', 0, 2000)
+                    if split_at < 1000:
+                        split_at = response.rfind(' ', 0, 2000)
+                    if split_at < 1000:
+                        split_at = 2000
+                    chunks.append(response[:split_at])
+                    response = response[split_at:].lstrip('\n')
+                for chunk in chunks:
+                    await channel.send(chunk)
+
+    @tasks.loop(time=time(hour=20, minute=0, tzinfo=ZoneInfo("America/Denver")))
+    async def weekly_recap(self):
+        """Post a weekly recap every Sunday at 8pm MT."""
+        now = datetime.now(ZoneInfo("America/Denver"))
+        if now.weekday() != 6:  # 6 = Sunday
+            return
+
+        if self.reminders_channel_id == 0:
+            return
+
+        channel = self.get_channel(self.reminders_channel_id)
+        if not channel:
+            logger.warning(f"Reminders channel {self.reminders_channel_id} not found for weekly recap.")
+            return
+
+        logger.info("Generating weekly recap...")
+        await self.run_recap_logic(channel, days=7)
+
+    @weekly_recap.before_loop
+    async def before_weekly_recap(self):
+        await self.wait_until_ready()
+
+if __name__ == "__main__":
+    from dotenv import load_dotenv
+    load_dotenv()
+    
+    token = os.getenv("DISCORD_TOKEN")
+    if not token:
+        raise ValueError("DISCORD_TOKEN not found in environment variables.")
+        
+    bot = RyanBot()
+    bot.run(token, log_handler=None)

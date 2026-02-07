@@ -1,0 +1,12 @@
+services:
+  ryanbot:
+    build: .
+    restart: on-failure
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./privatecredentials:/app/privatecredentials
+    environment:
+      # Ensure the bot looks for credentials here
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/privatecredentials/credentials.json

@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.env
+credentials.json
+data/
+.venv/
+.ruff_cache/
+privatecredentials/
+data/.alert_flag
