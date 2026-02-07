@@ -15,11 +15,28 @@ from src.graph import init_graph
 import src.graph as graph_module
 # Import basic file reader for the daily report
 from src.services.tools import read_knowledge_file, get_open_tasks, find_related_files, search_file_contents, build_library_index, get_library_files
-from src.graph import categorize_files, suggest_merges
+from src.services.categorization import categorize_files, suggest_merges
+from src.services.weather import fetch_current_weather, fetch_forecast
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("farmbot")
+
+DISCORD_MESSAGE_LIMIT = 2000
+INGESTION_CHUNK_SIZE = 50_000
+
+CHANNEL_CONTEXT = {
+    "journal": "[CONTEXT: User is posting in the JOURNAL channel. Prioritize logging updates and amending knowledge.]\n\n",
+    "questions": "[CONTEXT: User is posting in the QUESTIONS channel. You MUST use tools to retrieve info before answering.]\n\n",
+    "knowledge_ingest": (
+        "[CONTEXT: User is posting content to INGEST into the knowledge library.\n"
+        "Your job:\n"
+        "1. Identify all gardening/permaculture topics mentioned (plant names, techniques, etc.)\n"
+        "2. For EACH topic, call tool_amend_knowledge with the topic name and relevant facts\n"
+        "3. Be thorough - extract cultivar info, planting dates, care tips, companion plants, etc.\n"
+        "4. When done, reply with ONLY a short confirmation (under 500 chars): list the file names updated and a one-line summary. Do NOT repeat the ingested content back.]\n\n"
+    ),
+}
 
 class DebriefModal(discord.ui.Modal, title="Daily Garden Debrief"):
     activities = discord.ui.TextInput(
@@ -199,7 +216,7 @@ class FarmBot(commands.Bot):
             return ""
 
     @staticmethod
-    def _chunk_text(text: str, max_size: int = 50000) -> list[str]:
+    def _chunk_text(text: str, max_size: int = INGESTION_CHUNK_SIZE) -> list[str]:
         """Split text into chunks at natural boundaries."""
         if len(text) <= max_size:
             return [text]
@@ -229,23 +246,7 @@ class FarmBot(commands.Bot):
 
     async def _send_long_reply(self, message: discord.Message, response: str):
         """Send a reply, splitting into multiple messages if over Discord's 2000 char limit."""
-        if len(response) <= 2000:
-            await message.reply(response)
-            return
-
-        chunks = []
-        while response:
-            if len(response) <= 2000:
-                chunks.append(response)
-                break
-            split_at = response.rfind('\n', 0, 2000)
-            if split_at < 1000:
-                split_at = response.rfind(' ', 0, 2000)
-            if split_at < 1000:
-                split_at = 2000
-            chunks.append(response[:split_at])
-            response = response[split_at:].lstrip('\n')
-
+        chunks = self._chunk_text(response, max_size=DISCORD_MESSAGE_LIMIT)
         await message.reply(chunks[0])
         for chunk in chunks[1:]:
             await message.channel.send(chunk)
@@ -350,7 +351,7 @@ class FarmBot(commands.Bot):
             return
 
         await ctx.send("Triggering daily briefing manually...")
-        await self.run_daily_report_logic(ctx.channel)
+        await self.run_daily_report_logic(ctx.channel, manual=True)
 
 
     def _extract_text(self, content) -> str:
@@ -362,94 +363,6 @@ class FarmBot(commands.Bot):
             texts = [block.get('text', '') for block in content if isinstance(block, dict) and block.get('type') == 'text']
             return ''.join(texts)
         return str(content)
-
-    async def _fetch_weather(self) -> str:
-        if not all([self.weather_api_key, self.weather_lat, self.weather_lon]):
-            return "Weather configuration missing."
-
-        url = "https://api.openweathermap.org/data/2.5/weather"
-        params = {
-            "lat": self.weather_lat,
-            "lon": self.weather_lon,
-            "appid": self.weather_api_key,
-            "units": "metric"
-        }
-
-        async with httpx.AsyncClient() as client:
-            try:
-                resp = await client.get(url, params=params)
-                resp.raise_for_status()
-                data = resp.json()
-                weather_desc = data.get("weather", [{}])[0].get("description", "unknown")
-                temp = data.get("main", {}).get("temp", "unknown")
-                return f"Current Weather: {weather_desc}, Temperature: {temp}°C"
-            except Exception as e:
-                logger.error(f"Failed to fetch weather: {e}")
-                return "Could not fetch weather data."
-
-    async def _fetch_forecast(self) -> dict:
-        """Fetch 48-hour forecast from OpenWeatherMap (5-day/3-hour endpoint).
-
-        Returns dict with:
-          summary: human-readable forecast string
-          frost_risk: bool (any temp <= 2°C)
-          rain_alert: bool (>= 60% chance or >= 10mm total)
-          min_temp_c: float
-          max_rain_mm: float
-          max_rain_prob: float
-        """
-        if not all([self.weather_api_key, self.weather_lat, self.weather_lon]):
-            return {"summary": "Forecast configuration missing.", "frost_risk": False, "rain_alert": False}
-
-        url = "https://api.openweathermap.org/data/2.5/forecast"
-        params = {
-            "lat": self.weather_lat,
-            "lon": self.weather_lon,
-            "appid": self.weather_api_key,
-            "units": "metric",
-            "cnt": 16,  # 16 x 3hr = 48 hours
-        }
-
-        async with httpx.AsyncClient() as client:
-            try:
-                resp = await client.get(url, params=params)
-                resp.raise_for_status()
-                data = resp.json()
-
-                entries = data.get("list", [])
-                if not entries:
-                    return {"summary": "No forecast data available.", "frost_risk": False, "rain_alert": False}
-
-                min_temp = min(e.get("main", {}).get("temp_min", 99) for e in entries)
-                max_temp = max(e.get("main", {}).get("temp_max", -99) for e in entries)
-                max_rain_prob = max(e.get("pop", 0) for e in entries) * 100  # pop is 0-1
-                total_precip = sum(
-                    e.get("rain", {}).get("3h", 0) + e.get("snow", {}).get("3h", 0)
-                    for e in entries
-                )
-
-                frost_risk = min_temp <= 2
-                rain_alert = max_rain_prob >= 60 or total_precip >= 10
-
-                parts = [f"48-Hour Forecast: Low {min_temp:.0f}°C / High {max_temp:.0f}°C"]
-                if max_rain_prob > 0:
-                    parts.append(f"Rain chance up to {max_rain_prob:.0f}%, total precip {total_precip:.1f}mm")
-                if frost_risk:
-                    parts.append(f"⚠ FROST RISK — temps dropping to {min_temp:.0f}°C")
-                if rain_alert:
-                    parts.append("🌧 Significant rain expected")
-
-                return {
-                    "summary": ". ".join(parts),
-                    "frost_risk": frost_risk,
-                    "rain_alert": rain_alert,
-                    "min_temp_c": min_temp,
-                    "max_rain_mm": total_precip,
-                    "max_rain_prob": max_rain_prob,
-                }
-            except Exception as e:
-                logger.error(f"Failed to fetch forecast: {e}")
-                return {"summary": "Could not fetch forecast data.", "frost_risk": False, "rain_alert": False}
 
     async def _extract_images(self, message: discord.Message) -> list[dict]:
         """Extract image attachments from a Discord message as bytes with metadata."""
@@ -472,23 +385,9 @@ class FarmBot(commands.Bot):
         Passes the user input into the LangGraph workflow with channel-specific context.
         Uses thread_id for conversation memory via the SqliteSaver checkpointer.
         """
-        # Build channel-specific guidance and fold it into the HumanMessage
-        # (not a separate SystemMessage) to prevent old guidance from accumulating
-        # in the checkpoint history.
-        guidance = ""
-        if channel_type == "journal":
-            guidance = "[CONTEXT: User is posting in the JOURNAL channel. Prioritize logging updates and amending knowledge.]\n\n"
-        elif channel_type == "questions":
-            guidance = "[CONTEXT: User is posting in the QUESTIONS channel. You MUST use tools to retrieve info before answering.]\n\n"
-        elif channel_type == "knowledge_ingest":
-            guidance = (
-                "[CONTEXT: User is posting content to INGEST into the knowledge library.\n"
-                "Your job:\n"
-                "1. Identify all gardening/permaculture topics mentioned (plant names, techniques, etc.)\n"
-                "2. For EACH topic, call tool_amend_knowledge with the topic name and relevant facts\n"
-                "3. Be thorough - extract cultivar info, planting dates, care tips, companion plants, etc.\n"
-                "4. When done, reply with ONLY a short confirmation (under 500 chars): list the file names updated and a one-line summary. Do NOT repeat the ingested content back.]\n\n"
-            )
+        # Fold channel-specific guidance into the HumanMessage (not a separate
+        # SystemMessage) to prevent old guidance from accumulating in checkpoint history.
+        guidance = CHANNEL_CONTEXT.get(channel_type, "")
 
         if images:
             content_parts = [{"type": "text", "text": guidance + user_input}]
@@ -524,12 +423,12 @@ class FarmBot(commands.Bot):
 
         await self.run_daily_report_logic(channel)
 
-    async def run_daily_report_logic(self, channel):
+    async def run_daily_report_logic(self, channel, manual: bool = False):
         logger.info("Generating daily report...")
 
         # Pre-read knowledge files directly
-        weather_data = await self._fetch_weather()
-        forecast = await self._fetch_forecast()
+        weather_data = await fetch_current_weather(self.weather_api_key, self.weather_lat, self.weather_lon)
+        forecast = await fetch_forecast(self.weather_api_key, self.weather_lat, self.weather_lon)
 
         today = date.today().isoformat()
 
@@ -580,12 +479,8 @@ class FarmBot(commands.Bot):
 
             if "NO_ACTION" not in response:
                 await channel.send(f"**Morning Briefing:**\n{response}")
-            elif "Triggering daily briefing manually" in str(channel): # Just in case we are manual triggering and want feedback even if no action
-                 # Actually channel is a channel object, not string. 
-                 # If triggered manually, the user already saw "Triggering..." message.
-                 # If "NO_ACTION", maybe we should tell the manual user "No action".
-                 pass
-                 
+            elif manual:
+                await channel.send("Nothing urgent today — all clear!")
         except Exception as e:
             logger.error(f"Daily report failed: {e}")
             if channel:
@@ -813,7 +708,7 @@ class FarmBot(commands.Bot):
         if not channel:
             return
 
-        forecast = await self._fetch_forecast()
+        forecast = await fetch_forecast(self.weather_api_key, self.weather_lat, self.weather_lon)
         if not forecast.get("frost_risk") and not forecast.get("rain_alert"):
             return
 
@@ -891,24 +786,10 @@ class FarmBot(commands.Bot):
             await self._send_long_reply(reply_message, response)
         else:
             # For scheduled recaps, send directly to channel
-            if len(response) <= 2000:
-                await channel.send(f"**Weekly Garden Recap ({days} days)**\n{response}")
-            else:
-                await channel.send(f"**Weekly Garden Recap ({days} days)**")
-                chunks = []
-                while response:
-                    if len(response) <= 2000:
-                        chunks.append(response)
-                        break
-                    split_at = response.rfind('\n', 0, 2000)
-                    if split_at < 1000:
-                        split_at = response.rfind(' ', 0, 2000)
-                    if split_at < 1000:
-                        split_at = 2000
-                    chunks.append(response[:split_at])
-                    response = response[split_at:].lstrip('\n')
-                for chunk in chunks:
-                    await channel.send(chunk)
+            chunks = self._chunk_text(response, max_size=DISCORD_MESSAGE_LIMIT)
+            await channel.send(f"**Weekly Garden Recap ({days} days)**\n{chunks[0]}")
+            for chunk in chunks[1:]:
+                await channel.send(chunk)
 
     @tasks.loop(time=time(hour=20, minute=0, tzinfo=ZoneInfo("America/Denver")))
     async def weekly_recap(self):

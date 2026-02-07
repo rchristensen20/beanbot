@@ -53,18 +53,20 @@ A personal gardening assistant Discord bot powered by an agentic AI workflow.
 ```
 farmbot/
 ├── src/
-│   ├── bot.py                # Discord bot, message routing, daily cron
-│   ├── graph.py              # LangGraph state machine (agent ↔ tools loop)
+│   ├── bot.py                    # Discord bot, message routing, commands, scheduled crons
+│   ├── graph.py                  # LangGraph state machine (agent ↔ tools loop)
 │   └── services/
-│       └── tools.py          # File I/O tools (IO, tasks, harvests, calendar)
-├── data/                     # Markdown knowledge library (auto-managed)
-│   └── backups/              # Consolidation backups (timestamped)
-├── privatecredentials/       # Google Cloud service account key (git-ignored)
+│       ├── tools.py              # File I/O tools (tasks, harvests, calendar, search)
+│       ├── weather.py            # Async weather/forecast fetchers (OpenWeatherMap)
+│       └── categorization.py     # LLM-based file categorization and merge suggestions
+├── data/                         # Markdown knowledge library (auto-managed)
+│   └── backups/                  # Consolidation backups (timestamped)
+├── privatecredentials/           # Google Cloud service account key (git-ignored)
 │   └── credentials.json
 ├── docker-compose.yml
 ├── Dockerfile
 ├── pyproject.toml
-└── .env                      # Environment variables (git-ignored)
+└── .env                          # Environment variables (git-ignored)
 ```
 
 ### Environment Variables
@@ -143,8 +145,10 @@ Paste URLs, upload text files, or type knowledge directly. The bot extracts, chu
 | Module | Role |
 |---|---|
 | `src/bot.py` | Discord bot — routing, commands (`!briefing`, `!debrief`, `!consolidate`, `!recap`), scheduled loops (daily report, debrief, weather alerts, weekly recap), message parsing, debrief UI (modal + persistent view) |
-| `src/graph.py` | LangGraph state machine — agent loop with tools, plus direct LLM calls for file categorization (`categorize_files`, `suggest_merges`) |
-| `src/services/tools.py` | Core logic — file operations, task management, harvest logging, calendar generation |
+| `src/graph.py` | LangGraph state machine — agent loop with tools, system prompt, SQLite checkpointer |
+| `src/services/tools.py` | Core logic — file operations, task management, harvest logging, calendar generation, search |
+| `src/services/weather.py` | Standalone async functions for current weather and 48-hour forecast via OpenWeatherMap |
+| `src/services/categorization.py` | Direct LLM calls for semantic file categorization and merge suggestions (used by `!consolidate`) |
 | `data/` | Knowledge library — `tasks.md`, `harvests.md`, `planting_calendar.md`, `garden_log.md`, `categories.md`, and topic files |
 
 ## Future Enhancements

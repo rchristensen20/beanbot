@@ -14,15 +14,17 @@ Farmbot is a personal gardening assistant Discord bot for a small farm in Colora
 ## Architecture
 
 ```
-src/bot.py       → Discord bot: message routing, commands, scheduled crons, UI components
-src/graph.py     → LangGraph state machine: agent node ↔ tool node loop, system prompt, checkpointer
-src/services/tools.py → Pure functions: file I/O, task management, harvest logging, calendar generation
-data/            → Markdown knowledge library (auto-managed by the bot)
+src/bot.py                      → Discord bot: message routing, commands, scheduled crons, UI components
+src/graph.py                    → LangGraph state machine: agent node ↔ tool node loop, system prompt, checkpointer
+src/services/tools.py           → Pure functions: file I/O, task management, harvest logging, calendar generation
+src/services/weather.py         → Standalone async weather/forecast fetchers (OpenWeatherMap API)
+src/services/categorization.py  → LLM-based file categorization and merge suggestion (used by !consolidate)
+data/                           → Markdown knowledge library (auto-managed by the bot)
 ```
 
 ### Key patterns
 
-- **Channel-based routing** — `on_message` checks channel ID to determine context (journal, questions, knowledge_ingest, DM). Context string is prepended to the HumanMessage, not stored as a separate SystemMessage.
+- **Channel-based routing** — `on_message` checks channel ID to determine context (journal, questions, knowledge_ingest, DM). Context strings are defined in the `CHANNEL_CONTEXT` dict at the top of `bot.py` and prepended to the HumanMessage, not stored as a separate SystemMessage.
 - **PDF ingestion** — PDF attachments in the knowledge_ingest channel are detected by content type or `.pdf` extension, text-extracted via `pymupdf`, and fed into the same ingestion pipeline as URL/text content. Scanned PDFs without a text layer will yield empty results (no OCR).
 - **LLM processes everything** — Rather than rigid parsing, structured user input (like debrief forms) is sent as a prompt to the LangGraph agent. The agent decides which tools to call.
 - **Persistent Discord views** — `discord.ui.View(timeout=None)` with `custom_id` on buttons, registered in `setup_hook` via `self.add_view()` so they survive bot restarts.
@@ -38,7 +40,7 @@ data/            → Markdown knowledge library (auto-managed by the bot)
 
 ## Commands
 
-- `!briefing` — Manual trigger for the morning briefing (reminders or journal channel)
+- `!briefing` — Manual trigger for the morning briefing (reminders or journal channel). Shows "Nothing urgent today — all clear!" when there's nothing to report.
 - `!debrief` — Manual trigger for the evening debrief prompt (journal channel only)
 - `!consolidate <topic>` — Find all files related to a topic, back them up, merge/deduplicate into a single clean file, and delete merged sub-files (questions, reminders, or journal channel)
 - `!consolidate` (no args) — LLM-based semantic categorization: sends all filenames to Gemini in batches, groups them by plant type (Trees, Herbs, Vegetables, etc.), identifies merge candidates, saves results to `categories.md`, and posts a summary to Discord. Falls back to prefix-based grouping on LLM failure.
@@ -85,7 +87,10 @@ docker-compose logs -f
 - `tool_overwrite_file` replaces entire file contents — the agent uses this for tasks.md updates (checking boxes). If the agent hallucinates content, the file gets corrupted. The system prompt warns it to use caution.
 - The `trim_messages_for_context` function in `graph.py` keeps only the last 10 conversation turns to prevent context window overflow.
 - All file operations in `tools.py` use `os.path.basename()` to prevent directory traversal.
-- `tool_delete_file` has a hardcoded `SYSTEM_FILES` set preventing deletion of core files (`tasks.md`, `harvests.md`, `garden_log.md`, `planting_calendar.md`, `almanac.md`, `farm_layout.md`, `categories.md`).
+- `SYSTEM_FILES` is defined once at the top of `tools.py` and used by `tool_delete_file` (prevents deletion), `_list_md_paths` (excludes from search/calendar/library listings), and `generate_calendar_from_library` (skips during scan).
 - `!consolidate` always backs up files before modifying/deleting. Backups live in `data/backups/`.
-- `categorize_files()` and `suggest_merges()` in `graph.py` are direct LLM calls (no agent/tools) using `ChatVertexAI` without `.bind_tools()`. They batch files in groups of ~200 to avoid output token limits.
+- `categorize_files()` and `suggest_merges()` in `src/services/categorization.py` are direct LLM calls (no agent/tools) using `ChatVertexAI` without `.bind_tools()`. They batch files in groups of ~200 to avoid output token limits.
+- `fetch_current_weather()` and `fetch_forecast()` in `src/services/weather.py` are standalone async functions with explicit parameters. Weather threshold constants (`FROST_THRESHOLD_C`, `RAIN_PROB_THRESHOLD_PCT`, `RAIN_MM_THRESHOLD`) are defined there.
+- `_sanitize_topic()` and `_list_md_paths()` in `tools.py` are shared helpers used by multiple tool functions to avoid duplication.
+- `bot.py` constants: `DISCORD_MESSAGE_LIMIT` (2000) and `INGESTION_CHUNK_SIZE` (50,000) control text chunking via `_chunk_text()`. Both `_send_long_reply()` and `run_recap_logic()` delegate to `_chunk_text()`.
 - The system prompt maps "categories" questions to `categories.md` to prevent Gemini from hallucinating file lists from memory.

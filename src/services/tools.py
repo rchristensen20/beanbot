@@ -8,6 +8,28 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = "data"
 
+SYSTEM_FILES = {"tasks.md", "harvests.md", "garden_log.md", "planting_calendar.md", "almanac.md", "farm_layout.md", "categories.md"}
+
+
+def _sanitize_topic(topic: str) -> str:
+    """Sanitize a topic string into a safe, normalized filename stem."""
+    return "".join(c for c in topic if c.isalnum() or c in (' ', '_', '-')).strip().lower().replace(' ', '_')
+
+
+def _list_md_paths(exclude_system: bool = True, exclude_daily: bool = True) -> list[str]:
+    """List markdown file paths in the data directory, with optional filtering."""
+    paths = glob.glob(os.path.join(DATA_DIR, "*.md"))
+    result = []
+    for p in paths:
+        name = os.path.basename(p)
+        if exclude_system and name in SYSTEM_FILES:
+            continue
+        if exclude_daily and name.startswith("daily_"):
+            continue
+        result.append(p)
+    return result
+
+
 def list_knowledge_files() -> str:
     """
     Lists all available markdown files in the data directory.
@@ -74,8 +96,7 @@ def amend_topic_knowledge(topic: str, content: str) -> str:
         topic: The topic name, which becomes the filename (e.g., 'garlic' -> 'garlic.md').
         content: The note or fact to append.
     """
-    # Sanitize topic to be a valid filename
-    safe_topic = "".join(c for c in topic if c.isalnum() or c in (' ', '_', '-')).strip().lower().replace(' ', '_')
+    safe_topic = _sanitize_topic(topic)
     filename = f"{safe_topic}.md"
     path = os.path.join(DATA_DIR, filename)
     
@@ -181,17 +202,11 @@ def generate_calendar_from_library() -> str:
     Scans all knowledge files in data/ for planting info and generates 'planting_calendar.md'.
     """
     import re
-    files = glob.glob(os.path.join(DATA_DIR, "*.md"))
     calendar_entries = []
-    
-    # Files to skip
-    skip_files = ["almanac.md", "farm_layout.md", "garden_log.md", "tasks.md", "harvests.md", "planting_calendar.md"]
 
     count = 0
-    for file_path in files:
+    for file_path in _list_md_paths():
         filename = os.path.basename(file_path)
-        if filename in skip_files or filename.startswith("daily_"):
-            continue
             
         plant_name = filename.replace(".md", "").replace("_", " ").title()
         
@@ -247,10 +262,9 @@ def find_related_files(topic: str) -> str:
     Args:
         topic: The topic to search for (e.g., 'tomato', 'pepper', 'garlic').
     """
-    safe_topic = "".join(c for c in topic if c.isalnum() or c in (' ', '_', '-')).strip().lower().replace(' ', '_')
-    files = glob.glob(os.path.join(DATA_DIR, "*.md"))
+    safe_topic = _sanitize_topic(topic)
     matches = []
-    for f in files:
+    for f in _list_md_paths(exclude_system=False, exclude_daily=True):
         basename = os.path.basename(f).lower()
         if safe_topic in basename:
             matches.append(os.path.basename(f))
@@ -285,21 +299,15 @@ def get_current_date() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
-SYSTEM_FILES = {"tasks.md", "harvests.md", "garden_log.md", "planting_calendar.md", "almanac.md", "farm_layout.md", "categories.md"}
-
-
 def search_file_contents(query: str) -> list[str]:
     """
     Searches inside all .md files for case-insensitive mentions of a topic.
     Returns list of matching filenames (excluding system files and daily_* files).
     """
-    files = glob.glob(os.path.join(DATA_DIR, "*.md"))
     matches = []
     query_lower = query.lower()
-    for file_path in files:
+    for file_path in _list_md_paths():
         filename = os.path.basename(file_path)
-        if filename in SYSTEM_FILES or filename.startswith("daily_"):
-            continue
         try:
             with open(file_path, "r") as f:
                 content = f.read()
@@ -382,13 +390,10 @@ def get_library_files() -> list[dict]:
     Scan all knowledge files (excluding system files, daily_* files).
     Returns list of {filename, title, size_bytes}.
     """
-    files = glob.glob(os.path.join(DATA_DIR, "*.md"))
     entries = []
 
-    for file_path in files:
+    for file_path in _list_md_paths():
         filename = os.path.basename(file_path)
-        if filename in SYSTEM_FILES or filename.startswith("daily_"):
-            continue
         try:
             size = os.path.getsize(file_path)
             with open(file_path, "r") as f:
