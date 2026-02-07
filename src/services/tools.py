@@ -1,5 +1,7 @@
 import os
 import glob
+import json
+import re
 import shutil
 from datetime import datetime
 import logging
@@ -9,6 +11,8 @@ logger = logging.getLogger(__name__)
 DATA_DIR = "data"
 
 SYSTEM_FILES = {"tasks.md", "harvests.md", "garden_log.md", "planting_calendar.md", "almanac.md", "farm_layout.md", "categories.md"}
+
+MEMBERS_FILE = os.path.join(DATA_DIR, "members.json")
 
 
 def _sanitize_topic(topic: str) -> str:
@@ -33,6 +37,63 @@ def _list_md_paths(exclude_system: bool = True, exclude_daily: bool = True) -> l
 def is_onboarding_complete() -> bool:
     """Check if onboarding is complete (almanac.md exists)."""
     return os.path.exists(os.path.join(DATA_DIR, "almanac.md"))
+
+
+def _load_members() -> dict[str, int]:
+    """Reads data/members.json, returns {lowercase_name: discord_id}."""
+    if not os.path.exists(MEMBERS_FILE):
+        return {}
+    try:
+        with open(MEMBERS_FILE, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"Failed to load members: {e}")
+        return {}
+
+
+def _save_members(members: dict[str, int]) -> None:
+    """Writes data/members.json."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(MEMBERS_FILE, "w") as f:
+        json.dump(members, f, indent=2)
+
+
+def register_member(name: str, discord_id: int) -> str:
+    """Upserts a name -> discord_id mapping in the member registry."""
+    members = _load_members()
+    key = name.strip().lower()
+    members[key] = discord_id
+    _save_members(members)
+    return f"Registered '{name}' (ID: {discord_id})."
+
+
+def unregister_member(name: str) -> str:
+    """Removes a name from the member registry."""
+    members = _load_members()
+    key = name.strip().lower()
+    if key not in members:
+        return f"'{name}' is not registered."
+    del members[key]
+    _save_members(members)
+    return f"Unregistered '{name}'."
+
+
+def get_member_discord_id(name: str) -> int | None:
+    """Lookup discord_id by name."""
+    return _load_members().get(name.strip().lower())
+
+
+def get_member_name_by_discord_id(discord_id: int) -> str | None:
+    """Reverse lookup: find a name by discord_id."""
+    for name, did in _load_members().items():
+        if did == discord_id:
+            return name
+    return None
+
+
+def list_members() -> dict[str, int]:
+    """Returns full member registry {name: discord_id}."""
+    return _load_members()
 
 
 def list_knowledge_files() -> str:
@@ -121,19 +182,21 @@ def amend_topic_knowledge(topic: str, content: str) -> str:
         logger.error(f"Failed to write to {path}: {e}")
         return f"Error updating topic file: {str(e)}"
 
-def add_task(task_description: str, due_date: str = "") -> str:
+def add_task(task_description: str, due_date: str = "", assigned_to: str = "") -> str:
     """
     Adds a task to the task list.
     Args:
         task_description: The description of the task (e.g., "Fertilize the garlic").
         due_date: Optional due date in YYYY-MM-DD format.
+        assigned_to: Optional name of the person this task is assigned to.
     """
     filename = "tasks.md"
     path = os.path.join(DATA_DIR, filename)
-    
+
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    assigned_str = f" [Assigned: {assigned_to.strip()}]" if assigned_to.strip() else ""
     due_str = f" [Due: {due_date}]" if due_date else ""
-    formatted_entry = f"\n- [ ] {task_description}{due_str} (Created: {timestamp})"
+    formatted_entry = f"\n- [ ] {task_description}{assigned_str}{due_str} (Created: {timestamp})"
 
     
     try:
@@ -206,7 +269,6 @@ def generate_calendar_from_library() -> str:
     """
     Scans all knowledge files in data/ for planting info and generates 'planting_calendar.md'.
     """
-    import re
     calendar_entries = []
 
     count = 0
@@ -295,6 +357,28 @@ def get_open_tasks() -> list[str]:
     except Exception as e:
         logger.error(f"Failed to read tasks: {e}")
         return []
+
+
+def get_tasks_for_user(name: str) -> list[str]:
+    """
+    Returns open tasks assigned to `name` plus all unassigned open tasks.
+    Tasks assigned to other people are excluded.
+    """
+    assigned_re = re.compile(r'\[Assigned:\s*([^\]]+)\]', re.IGNORECASE)
+    open_tasks = get_open_tasks()
+    result = []
+    name_lower = name.strip().lower()
+    for task in open_tasks:
+        match = assigned_re.search(task)
+        if match:
+            assignee = match.group(1).strip().lower()
+            if assignee == name_lower:
+                result.append(task)
+            # else: assigned to someone else, skip
+        else:
+            # Unassigned — include for everyone
+            result.append(task)
+    return result
 
 
 def get_current_date() -> str:

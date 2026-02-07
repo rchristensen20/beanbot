@@ -27,6 +27,8 @@ from src.services.tools import (
     read_multiple_files,
     backup_file,
     delete_knowledge_file,
+    list_members,
+    get_tasks_for_user,
 )
 
 logger = logging.getLogger(__name__)
@@ -58,9 +60,9 @@ def tool_amend_knowledge(topic: str, content: str):
     return amend_topic_knowledge(topic, content)
 
 @tool
-def tool_add_task(task_description: str, due_date: str = ""):
-    """Adds a task to the tracker. Args: task_description (text), due_date (YYYY-MM-DD, optional)"""
-    return add_task(task_description, due_date)
+def tool_add_task(task_description: str, due_date: str = "", assigned_to: str = ""):
+    """Adds a task to the tracker. Args: task_description (text), due_date (YYYY-MM-DD, optional), assigned_to (name, optional)"""
+    return add_task(task_description, due_date, assigned_to)
 
 @tool
 def tool_log_harvest(crop: str, amount: str, location: str, notes: str = ""):
@@ -119,6 +121,23 @@ def tool_delete_file(filename: str):
     """Deletes a knowledge file after merging. Cannot delete system files (tasks.md, harvests.md, etc). Args: filename (e.g. 'garlic_care.md')"""
     return delete_knowledge_file(filename)
 
+@tool
+def tool_get_my_tasks(name: str):
+    """Returns open tasks assigned to a specific person plus all unassigned tasks. Tasks assigned to other people are excluded. Args: name (person's name)"""
+    tasks = get_tasks_for_user(name)
+    if not tasks:
+        return f"No open tasks for {name}."
+    return f"Tasks for {name}:\n" + "\n".join(tasks)
+
+@tool
+def tool_list_members():
+    """Lists all registered household/garden members and their Discord IDs."""
+    members = list_members()
+    if not members:
+        return "No members registered. Use !register <name> in Discord to add members."
+    lines = [f"- {name.title()} (ID: {did})" for name, did in members.items()]
+    return "Registered members:\n" + "\n".join(lines)
+
 TOOLS = [
     tool_list_files,
     tool_read_file,
@@ -135,6 +154,8 @@ TOOLS = [
     tool_read_multiple_files,
     tool_backup_file,
     tool_delete_file,
+    tool_get_my_tasks,
+    tool_list_members,
 ]
 
 
@@ -169,6 +190,12 @@ STATIC_SYSTEM_PROMPT = (
     "- 'tool_read_multiple_files': Read several files at once. More efficient than calling tool_read_file repeatedly.\n"
     "- 'tool_backup_file': Create a backup before modifying/deleting during consolidation.\n"
     "- 'tool_delete_file': Delete a knowledge file after merging. Cannot delete system files.\n"
+    "- 'tool_get_my_tasks': Returns open tasks assigned to a specific person plus all unassigned tasks. Args: name.\n"
+    "- 'tool_list_members': Lists all registered household/garden members.\n"
+    "- 'tool_add_task' supports an optional 'assigned_to' param. Use it when the user wants to assign a task to someone (e.g. 'remind George to weed').\n"
+    "IDENTITY: The user's name is injected as '[User: Name]' at the start of their message. "
+    "When they say 'my tasks', call 'tool_get_my_tasks' with their name. "
+    "When they assign tasks to someone, use the 'assigned_to' param. When no assignee is specified, leave it empty.\n"
     "INSTRUCTION: To answer questions, you MUST first call 'tool_read_file' with the appropriate filename.\n"
     "INSTRUCTION: If the user says they did something, FIRST read 'tasks.md' to see if it was a tracked task.\n"
     "   - IF it matches a task: Call 'tool_complete_task'. This tool AUTOMATICALLY logs to the journal, so do NOT call 'tool_update_journal' as well.\n"

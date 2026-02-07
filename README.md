@@ -10,7 +10,9 @@ A personal gardening assistant Discord bot powered by an agentic AI workflow.
 
 - **Knowledge library** — markdown files in `data/` that grow organically. Includes plant guides, daily logs, and farm layout info.
 
-- **Task Management** — Persistent todo list (`data/tasks.md`). The agent can schedule tasks with due dates, check them off upon completion, and remind you of urgent items during the daily briefing.
+- **Task Management** — Persistent todo list (`data/tasks.md`). The agent can schedule tasks with due dates, assign them to specific people, check them off upon completion, and remind you of urgent items during the daily briefing.
+
+- **Multi-user task delegation** — Register household or garden members with `!register`. Tasks can be assigned to specific people (e.g. "remind George to weed"). Each person sees their own tasks plus unassigned ones. The daily briefing groups tasks by assignee with @mentions.
 
 - **Harvest Tracking** — Structured harvest log (`data/harvests.md`). Track crops, amounts, and locations to monitor your garden's yield over time.
 
@@ -23,7 +25,7 @@ A personal gardening assistant Discord bot powered by an agentic AI workflow.
   - **Knowledge Ingest** — paste URLs, upload files, or type text for auto-ingestion
   - **DMs** — general conversation
 
-- **Daily briefing** — morning cron job. Fetches current weather and a 48-hour forecast, checks `tasks.md` for due items, reviews the `planting_calendar.md`, and reads recent logs to provide a morning summary. Includes frost/rain-based watering and protection advice. Supports manual triggering via `!briefing`.
+- **Daily briefing** — morning cron job. Fetches current weather and a 48-hour forecast, checks `tasks.md` for due items, reviews the `planting_calendar.md`, and reads recent logs to provide a morning summary. Includes frost/rain-based watering and protection advice. When members are registered, groups tasks by assignee with @mentions. Supports manual triggering via `!briefing`.
 
 - **Evening debrief** — evening cron job. Posts a summary of open tasks in the journal channel with a **"Log Today's Debrief"** button. Clicking the button opens a Discord modal with 5 optional fields (Activities, Harvests, Pest/Disease, Observations, Task Updates). On submit, the structured data is sent through the LLM agent. Supports manual triggering via `!debrief`. Buttons persist across bot restarts.
 
@@ -108,21 +110,24 @@ python -m src.bot
 
 | Module | Role |
 |---|---|
-| `src/bot.py` | Discord bot — routing, commands (`!briefing`, `!debrief`, `!consolidate`, `!recap`, `!setup`, `!version`), scheduled loops (daily report, debrief, weather alerts, weekly recap), message parsing, debrief UI (modal + persistent view), onboarding flow |
+| `src/bot.py` | Discord bot — routing, commands (`!briefing`, `!debrief`, `!consolidate`, `!recap`, `!setup`, `!register`, `!members`, `!commands`, `!version`), scheduled loops (daily report, debrief, weather alerts, weekly recap), message parsing, debrief UI (modal + persistent view), onboarding flow, user identity injection |
 | `src/graph.py` | LangGraph state machine — agent loop with tools, system prompt, SQLite checkpointer |
-| `src/services/tools.py` | Core logic — file operations, task management, harvest logging, calendar generation, search |
+| `src/services/tools.py` | Core logic — file operations, task management, harvest logging, calendar generation, search, member registry |
 | `src/services/weather.py` | Standalone async functions for current weather and 48-hour forecast via OpenWeatherMap |
 | `src/services/categorization.py` | Direct LLM calls for semantic file categorization and merge suggestions (used by `!consolidate`) |
-| `data/` | Knowledge library — `tasks.md`, `harvests.md`, `planting_calendar.md`, `garden_log.md`, `categories.md`, and topic files |
+| `data/` | Knowledge library — `tasks.md`, `harvests.md`, `planting_calendar.md`, `garden_log.md`, `categories.md`, `members.json`, and topic files |
 
 ## Commands
 
 - `!briefing` — Trigger the morning briefing manually (reminders or journal channel).
-- `!debrief` — Trigger the evening debrief prompt (journal channel).
+- `!debrief` — Trigger the evening debrief prompt (journal channel). Shows your assigned tasks + unassigned.
 - `!consolidate` — Categorize all knowledge files by type, identify merge candidates, save to `categories.md`.
 - `!consolidate <topic>` — Merge all files related to a topic into a single clean file (with backups).
 - `!recap [days]` — Summarize the last N days of garden activity (default 7, max 90).
 - `!setup` — Start the onboarding flow (walks you through location, garden layout, and orientation via DM).
+- `!register <name>` — Register yourself as a named garden member. Use `!register <name> @user` to register someone else.
+- `!members` — List all registered garden members.
+- `!commands` — Show all commands with brief usage.
 - `!version` — Show the current Beanbot version.
 
 ## How to Use
@@ -133,6 +138,8 @@ python -m src.bot
     *   "Remind me to prune the roses on Sunday."
     *   "What do I have to do today?"
     *   "I finished the pruning task."
+    *   "Remind George to weed the herb garden."
+    *   "What are George's tasks?"
 
 *   **Track Harvests**
     *   "Harvested 3 lbs of beans from Bed 2."

@@ -16,7 +16,7 @@ BOT_TZ = ZoneInfo(os.getenv("BOT_TIMEZONE", "America/Denver"))
 from src.graph import init_graph
 import src.graph as graph_module
 # Import basic file reader for the daily report
-from src.services.tools import read_knowledge_file, get_open_tasks, find_related_files, search_file_contents, build_library_index, get_library_files, is_onboarding_complete
+from src.services.tools import read_knowledge_file, get_open_tasks, find_related_files, search_file_contents, build_library_index, get_library_files, is_onboarding_complete, register_member, get_member_name_by_discord_id, list_members, get_tasks_for_user
 from src.services.categorization import categorize_files, suggest_merges
 from src.services.weather import fetch_current_weather, fetch_forecast
 
@@ -209,6 +209,18 @@ class BeanBot(commands.Bot):
         async def setup_cmd(ctx):
             await self.setup_onboarding(ctx)
 
+        @self.command(name="register")
+        async def register_cmd(ctx, name: str = "", member: discord.Member = None):
+            await self.register(ctx, name, member)
+
+        @self.command(name="members")
+        async def members_cmd(ctx):
+            await self.show_members(ctx)
+
+        @self.command(name="commands")
+        async def commands_cmd(ctx):
+            await self.show_commands(ctx)
+
         @self.command(name="version")
         async def version_cmd(ctx):
             await ctx.send(f"Beanbot v{BOT_VERSION}")
@@ -225,6 +237,51 @@ class BeanBot(commands.Bot):
 
     async def on_ready(self):
         logger.info(f"Logged in as {self.user} (ID: {self.user.id})")
+
+    async def register(self, ctx, name: str, member: discord.Member = None):
+        """Register a user as a named garden member."""
+        if not name:
+            await ctx.send("Usage: `!register <name>` or `!register <name> @user`")
+            return
+        target = member or ctx.author
+        result = register_member(name, target.id)
+        await ctx.send(f"Registered **{name.title()}** as <@{target.id}>.")
+
+    async def show_members(self, ctx):
+        """List all registered garden members."""
+        members = list_members()
+        if not members:
+            await ctx.send("No members registered. Use `!register <name>` to add yourself.")
+            return
+        lines = [f"- **{name.title()}**: <@{did}>" for name, did in members.items()]
+        await ctx.send("**Registered Members:**\n" + "\n".join(lines))
+
+    async def show_commands(self, ctx):
+        """Show all available commands with brief usage."""
+        text = (
+            "**Beanbot Commands**\n\n"
+            "`!briefing` — Trigger the morning briefing (weather, tasks, planting advice)\n"
+            "`!debrief` — Start the evening debrief (shows your tasks, opens logging form)\n"
+            "`!recap [days]` — Summarize the last N days of garden activity (default 7)\n"
+            "`!consolidate` — Categorize all knowledge files and find merge candidates\n"
+            "`!consolidate <topic>` — Merge all files about a topic into one clean file\n"
+            "`!register <name>` — Register yourself as a garden member\n"
+            "`!register <name> @user` — Register someone else as a garden member\n"
+            "`!members` — List all registered garden members\n"
+            "`!setup` — Run first-time onboarding (location, garden layout, orientation)\n"
+            "`!version` — Show the current Beanbot version\n"
+            "`!commands` — Show this help message"
+        )
+        await ctx.send(text)
+
+    def _inject_mentions(self, text: str) -> str:
+        """Replace registered member names with Discord @mentions in text."""
+        members = list_members()
+        for name, did in members.items():
+            # Case-insensitive word boundary match on the display name
+            pattern = re.compile(r'\b' + re.escape(name) + r'\b', re.IGNORECASE)
+            text = pattern.sub(f"<@{did}>", text)
+        return text
 
     def _extract_urls(self, text: str) -> list[str]:
         """Extract URLs from message text."""
@@ -389,6 +446,11 @@ class BeanBot(commands.Bot):
                 async with message.channel.typing():
                     content = message.content.replace(f"<@{self.user.id}>", "").strip()
 
+                    # Inject user identity if registered
+                    user_name = get_member_name_by_discord_id(message.author.id)
+                    if user_name:
+                        content = f"[User: {user_name.title()}] {content}"
+
                     # Extract image attachments
                     image_data = await self._extract_images(message)
 
@@ -499,6 +561,17 @@ class BeanBot(commands.Bot):
         if forecast.get("frost_risk"):
             forecast_guidance += "- Frost is expected! Suggest covering sensitive plants and bringing in any tender seedlings.\n"
 
+        # Build member context for task grouping
+        members = list_members()
+        member_context = ""
+        if members:
+            member_names = ", ".join(name.title() for name in members.keys())
+            member_context = (
+                f"\nREGISTERED MEMBERS: {member_names}\n"
+                "When listing tasks, group them by assignee. Show each person's assigned tasks under their name, "
+                "and list unassigned tasks in a separate 'Unassigned' section. Use the member names exactly as shown.\n"
+            )
+
         prompt = (
             f"Generate the daily morning briefing.\n"
             f"Today's Date: {today}\n"
@@ -511,6 +584,8 @@ class BeanBot(commands.Bot):
             "3. Recent log context (from garden_log.md)\n"
             "4. Weather-based advice based on the forecast\n"
         )
+        if member_context:
+            prompt += member_context
         if forecast_guidance:
             prompt += f"\nWEATHER NOTES:\n{forecast_guidance}\n"
         prompt += "If nothing is urgent, respond with exactly 'NO_ACTION'."
@@ -538,6 +613,8 @@ class BeanBot(commands.Bot):
                 logger.error(f"Failed to write daily file: {e}")
 
             if "NO_ACTION" not in response:
+                if members:
+                    response = self._inject_mentions(response)
                 await channel.send(f"**Morning Briefing:**\n{response}")
             elif manual:
                 await channel.send("Nothing urgent today — all clear!")
@@ -556,7 +633,7 @@ class BeanBot(commands.Bot):
             await ctx.send("This command can only be used in the journal channel.")
             return
 
-        await self.run_daily_debrief_logic(ctx.channel)
+        await self.run_daily_debrief_logic(ctx.channel, user_id=ctx.author.id)
 
     async def setup_onboarding(self, ctx):
         """Start the onboarding flow via DM."""
@@ -746,14 +823,27 @@ class BeanBot(commands.Bot):
                 logger.warning(f"LLM categorization failed: {e}", exc_info=True)
                 await ctx.send(f"Categorization failed: {type(e).__name__}: {e}")
 
-    async def run_daily_debrief_logic(self, channel):
+    async def run_daily_debrief_logic(self, channel, user_id: int = None):
         """Send the debrief prompt with open tasks and the debrief button."""
         logger.info("Sending daily debrief prompt...")
 
-        open_tasks = get_open_tasks()
-        if open_tasks:
-            task_list = "\n".join(open_tasks)
-            msg = f"**Evening Debrief — {date.today().isoformat()}**\n\nOpen tasks:\n{task_list}\n\nClick below to log what you did today."
+        if user_id:
+            # Manual !debrief — show the calling user's tasks + unassigned
+            user_name = get_member_name_by_discord_id(user_id)
+            if user_name:
+                tasks = get_tasks_for_user(user_name)
+                label = f"Your tasks ({user_name.title()})"
+            else:
+                tasks = get_open_tasks()
+                label = "Open tasks"
+        else:
+            # Scheduled 8 PM debrief — show all open tasks
+            tasks = get_open_tasks()
+            label = "Open tasks"
+
+        if tasks:
+            task_list = "\n".join(tasks)
+            msg = f"**Evening Debrief — {date.today().isoformat()}**\n\n{label}:\n{task_list}\n\nClick below to log what you did today."
         else:
             msg = f"**Evening Debrief — {date.today().isoformat()}**\n\nNo open tasks. Click below to log what you did today."
 

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Member registry (`data/members.json`) with `!register <name>` and `!members` commands
+- Task assignment via `[Assigned: Name]` tags — assign tasks to specific people
+- `tool_get_my_tasks` — returns a user's assigned tasks plus unassigned tasks
+- `tool_list_members` — lists registered garden members
+- User identity injection — registered users' messages are prefixed with `[User: Name]` so the LLM knows who's asking
+- Daily briefing groups tasks by assignee with Discord @mentions when members are registered
+- `!debrief` shows the calling user's tasks + unassigned tasks (when registered)
+- `!commands` — lists all commands with brief usage
+
 ## [1.1.0] - 2026-02-07
 
 ## [1.0.0] - 2025-07-05
