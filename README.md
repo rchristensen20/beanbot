@@ -43,6 +43,23 @@ A personal gardening assistant Discord bot powered by an agentic AI workflow.
 
 - **Docker deployment** — single `docker-compose up` with volume persistence.
 
+## Screenshots
+
+### Knowledge Ingestion
+Share a link or upload a file — the bot extracts the content and saves it to your knowledge library.
+
+![Knowledge Ingestion](docs/screenshots/knowledge-ingestion.png)
+
+### Task Management
+Set tasks and reminders with natural language. The bot tracks due dates and assignees.
+
+![Task Management](docs/screenshots/task-management.png)
+
+### Garden Photo Recognition
+Upload a photo of your garden — the bot identifies what it sees and updates your layout.
+
+![Garden Photo Recognition](docs/screenshots/garden-photo.png)
+
 ## Quick Start
 
 ### 1. Create a Discord Bot
