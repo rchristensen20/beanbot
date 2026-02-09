@@ -23,7 +23,7 @@ RUN uv sync --frozen
 RUN mkdir -p data
 
 # Non-root user: bot process can only write to data/
-RUN useradd --create-home --uid 1000 beanbot && chown beanbot:beanbot data
+RUN useradd --create-home --uid 10000 beanbot && chown beanbot:beanbot data
 USER beanbot
 
 # Command to run the bot
