@@ -281,6 +281,7 @@ class BeanBot(commands.Bot):
         self.daily_debrief.start()
         self.weather_alerts.start()
         self.weekly_recap.start()
+        self.db_prune.start()
         logger.info("BeanBot setup complete. All schedulers started.")
 
     async def on_ready(self):
@@ -1230,6 +1231,86 @@ class BeanBot(commands.Bot):
     @weekly_recap.before_loop
     async def before_weekly_recap(self):
         await self.wait_until_ready()
+
+    # --- Database Checkpoint Pruning (nightly at 3 AM) ---
+
+    @tasks.loop(time=time(hour=3, minute=0, tzinfo=BOT_TZ))
+    async def db_prune(self):
+        """Nightly pruning of old conversation checkpoints."""
+        await self._run_db_prune()
+
+    @db_prune.before_loop
+    async def before_db_prune(self):
+        await self.wait_until_ready()
+
+    async def _run_db_prune(self):
+        """Delete old ephemeral checkpoints and trim persistent threads."""
+        import aiosqlite
+        from src.graph import DB_PATH
+
+        cutoff = (date.today() - timedelta(days=7)).isoformat()
+
+        try:
+            async with aiosqlite.connect(DB_PATH) as conn:
+                # 1) Delete ephemeral threads older than 7 days
+                #    These have date suffixes like daily_report_2025-06-15
+                ephemeral_prefixes = [
+                    "daily_report_",
+                    "debrief_",
+                    "recap_",
+                    "consolidate_",
+                ]
+                total_deleted = 0
+
+                for prefix in ephemeral_prefixes:
+                    # ISO date string comparison works for chronological ordering
+                    cursor = await conn.execute(
+                        "DELETE FROM writes WHERE thread_id LIKE ? AND thread_id < ?",
+                        (f"{prefix}%", f"{prefix}{cutoff}"),
+                    )
+                    total_deleted += cursor.rowcount
+                    cursor = await conn.execute(
+                        "DELETE FROM checkpoints WHERE thread_id LIKE ? AND thread_id < ?",
+                        (f"{prefix}%", f"{prefix}{cutoff}"),
+                    )
+                    total_deleted += cursor.rowcount
+
+                # 2) For persistent threads (numeric channel IDs), keep only last 20 checkpoints
+                cursor = await conn.execute(
+                    "SELECT DISTINCT thread_id FROM checkpoints WHERE thread_id GLOB '[0-9]*'"
+                )
+                persistent_threads = [row[0] for row in await cursor.fetchall()]
+
+                for tid in persistent_threads:
+                    # Get the 20th newest checkpoint_id as cutoff
+                    cursor = await conn.execute(
+                        "SELECT checkpoint_id FROM checkpoints "
+                        "WHERE thread_id = ? ORDER BY checkpoint_id DESC LIMIT 1 OFFSET 19",
+                        (tid,),
+                    )
+                    row = await cursor.fetchone()
+                    if row:
+                        cutoff_id = row[0]
+                        cursor = await conn.execute(
+                            "DELETE FROM writes WHERE thread_id = ? AND checkpoint_id < ?",
+                            (tid, cutoff_id),
+                        )
+                        total_deleted += cursor.rowcount
+                        cursor = await conn.execute(
+                            "DELETE FROM checkpoints WHERE thread_id = ? AND checkpoint_id < ?",
+                            (tid, cutoff_id),
+                        )
+                        total_deleted += cursor.rowcount
+
+                await conn.commit()
+
+                # 3) VACUUM to reclaim disk space
+                await conn.execute("VACUUM")
+
+                logger.info(f"DB prune complete: {total_deleted} rows deleted.")
+
+        except Exception as e:
+            logger.error(f"DB prune failed: {e}")
 
 if __name__ == "__main__":
     from dotenv import load_dotenv
