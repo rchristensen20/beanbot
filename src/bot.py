@@ -17,7 +17,7 @@ BOT_TZ = ZoneInfo(os.getenv("BOT_TIMEZONE", "America/Denver"))
 from src.graph import init_graph
 import src.graph as graph_module
 # Import basic file reader for the daily report
-from src.services.tools import read_knowledge_file, get_open_tasks, find_related_files, search_file_contents, build_library_index, get_library_files, is_onboarding_complete, register_member, get_member_name_by_discord_id, list_members, get_tasks_for_user, get_clearable_knowledge_files, clear_all_knowledge_files, clear_entire_garden, delete_knowledge_file, _sanitize_topic, SYSTEM_FILES, DATA_DIR
+from src.services.tools import read_knowledge_file, get_open_tasks, find_related_files, search_file_contents, build_library_index, get_library_files, is_onboarding_complete, register_member, get_member_name_by_discord_id, list_members, get_tasks_for_user, get_clearable_knowledge_files, clear_all_knowledge_files, clear_entire_garden, delete_knowledge_file, complete_task, _sanitize_topic, SYSTEM_FILES, DATA_DIR
 from src.services.categorization import categorize_files, suggest_merges
 from src.services.weather import fetch_current_weather, fetch_forecast
 
@@ -46,6 +46,32 @@ def _read_version() -> str:
 
 
 BOT_VERSION = _read_version()
+
+
+def _extract_task_description(task_line: str) -> str:
+    """Strip metadata from a raw task line for clean display in the debrief Select menu.
+
+    Input:  '- [ ] Water the tomatoes [Assigned: Ryan] [Due: 2025-06-15] (Created: 2025-06-14 08:30:00)'
+    Output: 'Water the tomatoes (Due: Jun 15)'
+    """
+    text = task_line.strip()
+    # Remove checkbox prefix
+    text = re.sub(r'^- \[[ x]\] ', '', text)
+    # Extract due date before stripping
+    due_match = re.search(r'\[Due:\s*(\d{4}-\d{2}-\d{2})\]', text)
+    due_suffix = ""
+    if due_match:
+        try:
+            dt = datetime.strptime(due_match.group(1), "%Y-%m-%d")
+            due_suffix = f" (Due: {dt.strftime('%b %-d')})"
+        except ValueError:
+            due_suffix = f" (Due: {due_match.group(1)})"
+    # Strip metadata tags
+    text = re.sub(r'\s*\[Assigned:\s*[^\]]*\]', '', text)
+    text = re.sub(r'\s*\[Due:\s*[^\]]*\]', '', text)
+    text = re.sub(r'\s*\(Created:\s*[^)]*\)', '', text)
+    return (text.strip() + due_suffix).strip()
+
 
 CHANNEL_CONTEXT = {
     "journal": "[CONTEXT: User is posting in the JOURNAL channel. Prioritize logging updates and amending knowledge.]\n\n",
@@ -171,6 +197,105 @@ class DebriefView(discord.ui.View):
         custom_id="debrief_button",
     )
     async def debrief_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(DebriefModal(self.bot))
+
+
+class DebriefTaskView(discord.ui.View):
+    """Non-persistent debrief view with a task-completion Select menu + debrief button."""
+
+    def __init__(self, bot: "BeanBot", tasks: list[str]):
+        super().__init__(timeout=None)
+        self.bot = bot
+        self.tasks = tasks  # raw task lines from tasks.md
+
+        # Build the Select menu (Discord caps at 25 options)
+        options = []
+        for i, task_line in enumerate(tasks[:25]):
+            label = _extract_task_description(task_line)[:100]  # Discord 100-char limit
+            options.append(discord.SelectOption(label=label, value=str(i)))
+
+        select = discord.ui.Select(
+            placeholder="Select completed tasks...",
+            min_values=0,
+            max_values=len(options),
+            options=options,
+        )
+        select.callback = self._select_callback
+        self._select = select
+        self.add_item(select)
+
+        # "Mark Complete" button
+        mark_btn = discord.ui.Button(
+            label="Mark Complete",
+            style=discord.ButtonStyle.secondary,
+        )
+        mark_btn.callback = self._mark_complete
+        self.add_item(mark_btn)
+
+        # "Log Today's Debrief" button — same custom_id as the persistent DebriefView
+        debrief_btn = discord.ui.Button(
+            label="Log Today's Debrief",
+            style=discord.ButtonStyle.primary,
+            custom_id="debrief_button",
+        )
+        debrief_btn.callback = self._open_debrief_modal
+        self.add_item(debrief_btn)
+
+    async def _select_callback(self, interaction: discord.Interaction):
+        # Just acknowledge — selections are stored on the Select widget
+        await interaction.response.defer()
+
+    async def _mark_complete(self, interaction: discord.Interaction):
+        selected = self._select.values
+        if not selected:
+            await interaction.response.send_message(
+                "No tasks selected. Pick tasks from the dropdown first.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(thinking=True)
+
+        completed_names = []
+        for idx_str in selected:
+            idx = int(idx_str)
+            task_line = self.tasks[idx]
+            # Extract a snippet for complete_task (description without checkbox prefix)
+            snippet = re.sub(r'^- \[[ x]\] ', '', task_line.strip())
+            # Use just the first part (before metadata) as the snippet for matching
+            snippet_clean = re.sub(r'\s*\[Assigned:.*', '', snippet)
+            snippet_clean = re.sub(r'\s*\[Due:.*', '', snippet_clean)
+            snippet_clean = re.sub(r'\s*\(Created:.*', '', snippet_clean).strip()
+            result = complete_task(snippet_clean)
+            completed_names.append(_extract_task_description(task_line))
+
+        # Rebuild the view with remaining open tasks
+        remaining_tasks = get_open_tasks()
+        summary = "\n".join(f"- ~~{name}~~" for name in completed_names)
+
+        if remaining_tasks:
+            task_display = "\n".join(
+                f"- {_extract_task_description(t)}" for t in remaining_tasks
+            )
+            new_msg = (
+                f"**Marked {len(completed_names)} task(s) complete:**\n{summary}\n\n"
+                f"**Remaining tasks:**\n{task_display}\n\n"
+                f"Click below to log what you did today."
+            )
+            new_view = DebriefTaskView(self.bot, remaining_tasks)
+        else:
+            new_msg = (
+                f"**Marked {len(completed_names)} task(s) complete:**\n{summary}\n\n"
+                f"All tasks done! Click below to log what you did today."
+            )
+            new_view = DebriefView(self.bot)
+
+        await interaction.followup.edit_message(
+            message_id=interaction.message.id,
+            content=new_msg,
+            view=new_view,
+        )
+
+    async def _open_debrief_modal(self, interaction: discord.Interaction):
         await interaction.response.send_modal(DebriefModal(self.bot))
 
 
@@ -1075,36 +1200,40 @@ class BeanBot(commands.Bot):
                 await ctx.send(f"Categorization failed: {type(e).__name__}: {e}")
 
     async def run_daily_debrief_logic(self, channel, user_id: int = None):
-        """Send the debrief prompt with open tasks and the debrief button."""
+        """Send the debrief prompt with open tasks, a task-completion Select, and the debrief button."""
         logger.info("Sending daily debrief prompt...")
 
         if user_id:
             # Manual !debrief — show the calling user's tasks + unassigned
             user_name = get_member_name_by_discord_id(user_id)
             if user_name:
-                tasks = get_tasks_for_user(user_name)
+                open_tasks = get_tasks_for_user(user_name)
                 label = f"Your tasks ({user_name.title()})"
             else:
-                tasks = get_open_tasks()
+                open_tasks = get_open_tasks()
                 label = "Open tasks"
         else:
             # Scheduled 8 PM debrief — show all open tasks
-            tasks = get_open_tasks()
+            open_tasks = get_open_tasks()
             label = "Open tasks"
 
-        if tasks:
-            task_list = "\n".join(tasks)
-            msg = f"**Evening Debrief — {date.today().isoformat()}**\n\n{label}:\n{task_list}\n\nClick below to log what you did today."
+        if open_tasks:
+            task_display = "\n".join(
+                f"- {_extract_task_description(t)}" for t in open_tasks
+            )
+            msg = f"**Evening Debrief — {date.today().isoformat()}**\n\n{label}:\n{task_display}\n\nSelect completed tasks below, then click **Mark Complete**. When you're done, click **Log Today's Debrief**."
+            view = DebriefTaskView(self, open_tasks)
         else:
             msg = f"**Evening Debrief — {date.today().isoformat()}**\n\nNo open tasks. Click below to log what you did today."
+            view = DebriefView(self)
 
         if len(msg) <= DISCORD_MESSAGE_LIMIT:
-            await channel.send(msg, view=DebriefView(self))
+            await channel.send(msg, view=view)
         else:
             chunks = self._chunk_text(msg, max_size=DISCORD_MESSAGE_LIMIT)
             for chunk in chunks[:-1]:
                 await channel.send(chunk)
-            await channel.send(chunks[-1], view=DebriefView(self))
+            await channel.send(chunks[-1], view=view)
 
     @tasks.loop(time=time(hour=20, minute=0, tzinfo=BOT_TZ))
     async def daily_debrief(self):
