@@ -1098,7 +1098,13 @@ class BeanBot(commands.Bot):
         else:
             msg = f"**Evening Debrief — {date.today().isoformat()}**\n\nNo open tasks. Click below to log what you did today."
 
-        await channel.send(msg, view=DebriefView(self))
+        if len(msg) <= DISCORD_MESSAGE_LIMIT:
+            await channel.send(msg, view=DebriefView(self))
+        else:
+            chunks = self._chunk_text(msg, max_size=DISCORD_MESSAGE_LIMIT)
+            for chunk in chunks[:-1]:
+                await channel.send(chunk)
+            await channel.send(chunks[-1], view=DebriefView(self))
 
     @tasks.loop(time=time(hour=20, minute=0, tzinfo=BOT_TZ))
     async def daily_debrief(self):

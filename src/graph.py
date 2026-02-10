@@ -57,7 +57,10 @@ def tool_update_journal(entry: str):
 @tool
 def tool_amend_knowledge(topic: str, content: str):
     """Updates a specific topic file with new notes/facts. Args: topic (e.g. 'garlic'), content (text)"""
-    return amend_topic_knowledge(topic, content)
+    logger.info(f"tool_amend_knowledge called: topic={topic!r}, content_len={len(content)}")
+    result = amend_topic_knowledge(topic, content)
+    logger.info(f"tool_amend_knowledge result: {result}")
+    return result
 
 @tool
 def tool_add_task(task_description: str, due_date: str = "", assigned_to: str = ""):
