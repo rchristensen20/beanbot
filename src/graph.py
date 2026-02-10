@@ -3,7 +3,7 @@ import os
 import logging
 from typing import List, TypedDict, Annotated
 from langgraph.graph.message import add_messages
-from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, HumanMessage
 from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, END
@@ -161,6 +161,14 @@ TOOLS = [
     tool_list_members,
 ]
 
+# Build a lookup to fix tool names when Gemini drops the "tool_" prefix.
+_TOOL_NAME_SET = {t.name for t in TOOLS}
+_TOOL_NAME_FIX = {
+    t.name.removeprefix("tool_"): t.name
+    for t in TOOLS
+    if t.name.startswith("tool_")
+}
+
 
 
 # --- State Definition ---
@@ -253,12 +261,48 @@ def trim_messages_for_context(messages: List[BaseMessage], max_turns: int = 10) 
     return leading_system + messages[cutoff_idx:]
 
 
+def _fix_tool_call_names(response: AIMessage) -> AIMessage:
+    """Fix tool call names when Gemini drops the 'tool_' prefix."""
+    if not getattr(response, "tool_calls", None):
+        return response
+    fixed = False
+    new_tool_calls = []
+    for tc in response.tool_calls:
+        name = tc["name"]
+        if name not in _TOOL_NAME_SET and name in _TOOL_NAME_FIX:
+            logger.warning("Fixing tool call name: %s -> %s", name, _TOOL_NAME_FIX[name])
+            new_tool_calls.append({**tc, "name": _TOOL_NAME_FIX[name]})
+            fixed = True
+        else:
+            new_tool_calls.append(tc)
+    if not fixed:
+        return response
+    # Rebuild the AIMessage with corrected tool_calls and tool_call chunks
+    new_chunks = []
+    for chunk in response.additional_kwargs.get("tool_calls", []):
+        fn_name = chunk.get("function", {}).get("name", "")
+        if fn_name in _TOOL_NAME_FIX:
+            chunk = {**chunk, "function": {**chunk["function"], "name": _TOOL_NAME_FIX[fn_name]}}
+        new_chunks.append(chunk)
+    new_kwargs = {**response.additional_kwargs}
+    if new_chunks:
+        new_kwargs["tool_calls"] = new_chunks
+    return AIMessage(
+        content=response.content,
+        tool_calls=new_tool_calls,
+        additional_kwargs=new_kwargs,
+        response_metadata=response.response_metadata,
+        id=response.id,
+    )
+
+
 def agent_node(state: AgentState):
     """
     Standard agent node:
     1. Trim accumulated history to last ~10 turns.
     2. Prepend static instructions.
     3. Invoke model.
+    4. Fix tool call names if Gemini dropped the 'tool_' prefix.
     """
     model = get_model()
     messages = trim_messages_for_context(state['messages'])
@@ -266,6 +310,7 @@ def agent_node(state: AgentState):
     conversation = [SystemMessage(content=STATIC_SYSTEM_PROMPT)] + messages
 
     response = model.invoke(conversation)
+    response = _fix_tool_call_names(response)
     return {"messages": [response]}
 
 # --- Graph Construction ---
