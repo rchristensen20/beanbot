@@ -181,6 +181,7 @@ STATIC_SYSTEM_PROMPT = (
     "You have access to a knowledge library, but you must read the files to see their content.\n"
     "TOOLS:\n"
     "- 'tool_read_file': Read content.\n"
+    "- 'tool_amend_knowledge': Add or update knowledge about a topic. Creates the file if it doesn't exist, appends if it does.\n"
     "- 'tool_add_task': Schedule a reminder.\n"
     "- 'tool_log_harvest': Record yields.\n"
     "- 'tool_complete_task': Mark a task as done. Args: substring of task description.\n"
