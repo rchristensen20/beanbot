@@ -178,10 +178,14 @@ class AgentState(TypedDict):
 
 # --- Node Logic ---
 
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0"))
+MAX_CONTEXT_TURNS = int(os.getenv("MAX_CONTEXT_TURNS", "10"))
+
+
 def get_model():
     return ChatGoogleGenerativeAI(
         model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
-        temperature=0
+        temperature=LLM_TEMPERATURE,
     ).bind_tools(TOOLS)
 
 STATIC_SYSTEM_PROMPT = (
@@ -234,7 +238,7 @@ STATIC_SYSTEM_PROMPT = (
 )
 
 
-def trim_messages_for_context(messages: List[BaseMessage], max_turns: int = 10) -> List[BaseMessage]:
+def trim_messages_for_context(messages: List[BaseMessage], max_turns: int = MAX_CONTEXT_TURNS) -> List[BaseMessage]:
     """Keep only the last ~max_turns conversation turns to prevent context window blowup.
 
     Preserves any leading SystemMessages, then keeps the last max_turns HumanMessage

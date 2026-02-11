@@ -1,15 +1,17 @@
+import os
 import logging
 import httpx
 
 logger = logging.getLogger(__name__)
 
-FROST_THRESHOLD_C = 2
-RAIN_PROB_THRESHOLD_PCT = 60
-RAIN_MM_THRESHOLD = 10
-FORECAST_ENTRY_COUNT = 16
+FROST_THRESHOLD_C = float(os.getenv("FROST_THRESHOLD_C", "2"))
+FROST_THRESHOLD_F = float(os.getenv("FROST_THRESHOLD_F", "36"))
+RAIN_PROB_THRESHOLD_PCT = float(os.getenv("RAIN_PROB_THRESHOLD_PCT", "60"))
+RAIN_MM_THRESHOLD = float(os.getenv("RAIN_MM_THRESHOLD", "10"))
+FORECAST_ENTRY_COUNT = int(os.getenv("FORECAST_ENTRY_COUNT", "16"))
 
 
-async def fetch_current_weather(api_key: str, lat: str, lon: str) -> str:
+async def fetch_current_weather(api_key: str, lat: str, lon: str, units: str = "metric") -> str:
     """Fetch current weather from OpenWeatherMap."""
     if not all([api_key, lat, lon]):
         return "Weather configuration missing."
@@ -19,8 +21,10 @@ async def fetch_current_weather(api_key: str, lat: str, lon: str) -> str:
         "lat": lat,
         "lon": lon,
         "appid": api_key,
-        "units": "metric"
+        "units": units,
     }
+
+    temp_label = "°F" if units == "imperial" else "°C"
 
     async with httpx.AsyncClient() as client:
         try:
@@ -29,20 +33,20 @@ async def fetch_current_weather(api_key: str, lat: str, lon: str) -> str:
             data = resp.json()
             weather_desc = data.get("weather", [{}])[0].get("description", "unknown")
             temp = data.get("main", {}).get("temp", "unknown")
-            return f"Current Weather: {weather_desc}, Temperature: {temp}°C"
+            return f"Current Weather: {weather_desc}, Temperature: {temp}{temp_label}"
         except Exception as e:
             logger.error(f"Failed to fetch weather: {e}")
             return "Could not fetch weather data."
 
 
-async def fetch_forecast(api_key: str, lat: str, lon: str) -> dict:
+async def fetch_forecast(api_key: str, lat: str, lon: str, units: str = "metric") -> dict:
     """Fetch 48-hour forecast from OpenWeatherMap (5-day/3-hour endpoint).
 
     Returns dict with:
       summary: human-readable forecast string
-      frost_risk: bool (any temp <= FROST_THRESHOLD_C)
+      frost_risk: bool (any temp <= frost threshold for the configured units)
       rain_alert: bool (>= RAIN_PROB_THRESHOLD_PCT chance or >= RAIN_MM_THRESHOLD total)
-      min_temp_c: float
+      min_temp: float
       max_rain_mm: float
       max_rain_prob: float
     """
@@ -54,9 +58,14 @@ async def fetch_forecast(api_key: str, lat: str, lon: str) -> dict:
         "lat": lat,
         "lon": lon,
         "appid": api_key,
-        "units": "metric",
+        "units": units,
         "cnt": FORECAST_ENTRY_COUNT,  # 16 x 3hr = 48 hours
     }
+
+    imperial = units == "imperial"
+    temp_label = "°F" if imperial else "°C"
+    precip_label = "in" if imperial else "mm"
+    frost_threshold = FROST_THRESHOLD_F if imperial else FROST_THRESHOLD_C
 
     async with httpx.AsyncClient() as client:
         try:
@@ -76,14 +85,14 @@ async def fetch_forecast(api_key: str, lat: str, lon: str) -> dict:
                 for e in entries
             )
 
-            frost_risk = min_temp <= FROST_THRESHOLD_C
+            frost_risk = min_temp <= frost_threshold
             rain_alert = max_rain_prob >= RAIN_PROB_THRESHOLD_PCT or total_precip >= RAIN_MM_THRESHOLD
 
-            parts = [f"48-Hour Forecast: Low {min_temp:.0f}°C / High {max_temp:.0f}°C"]
+            parts = [f"48-Hour Forecast: Low {min_temp:.0f}{temp_label} / High {max_temp:.0f}{temp_label}"]
             if max_rain_prob > 0:
-                parts.append(f"Rain chance up to {max_rain_prob:.0f}%, total precip {total_precip:.1f}mm")
+                parts.append(f"Rain chance up to {max_rain_prob:.0f}%, total precip {total_precip:.1f}{precip_label}")
             if frost_risk:
-                parts.append(f"⚠ FROST RISK — temps dropping to {min_temp:.0f}°C")
+                parts.append(f"⚠ FROST RISK — temps dropping to {min_temp:.0f}{temp_label}")
             if rain_alert:
                 parts.append("🌧 Significant rain expected")
 
@@ -91,7 +100,7 @@ async def fetch_forecast(api_key: str, lat: str, lon: str) -> dict:
                 "summary": ". ".join(parts),
                 "frost_risk": frost_risk,
                 "rain_alert": rain_alert,
-                "min_temp_c": min_temp,
+                "min_temp": min_temp,
                 "max_rain_mm": total_precip,
                 "max_rain_prob": max_rain_prob,
             }

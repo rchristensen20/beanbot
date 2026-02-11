@@ -381,6 +381,26 @@ def get_tasks_for_user(name: str) -> list[str]:
     return result
 
 
+def filter_tasks_due_today_or_overdue(tasks: list[str], today_str: str) -> list[str]:
+    """Filter tasks to only those due today or overdue (or with no due date).
+
+    Args:
+        tasks: List of raw task lines from tasks.md.
+        today_str: Today's date as YYYY-MM-DD string (timezone-aware from caller).
+    """
+    due_re = re.compile(r'\[Due:\s*(\d{4}-\d{2}-\d{2})\]')
+    result = []
+    for task in tasks:
+        match = due_re.search(task)
+        if match:
+            if match.group(1) <= today_str:
+                result.append(task)
+        else:
+            # No due date — include (can't be deferred)
+            result.append(task)
+    return result
+
+
 def get_current_date() -> str:
     """
     Returns the current date and time.

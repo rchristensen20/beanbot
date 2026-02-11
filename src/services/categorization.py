@@ -9,7 +9,8 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 
 logger = logging.getLogger(__name__)
 
-CATEGORIZE_BATCH_SIZE = 200
+CATEGORIZE_BATCH_SIZE = int(os.getenv("CATEGORIZE_BATCH_SIZE", "200"))
+CATEGORIZE_MAX_TOKENS = int(os.getenv("CATEGORIZE_MAX_TOKENS", "16384"))
 
 
 def _extract_json(text: str) -> dict | list:
@@ -85,7 +86,7 @@ async def categorize_files(file_entries: list[dict], progress_callback=None) -> 
     model = ChatGoogleGenerativeAI(
         model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
         temperature=0,
-        max_output_tokens=16384,
+        max_output_tokens=CATEGORIZE_MAX_TOKENS,
     )
 
     # Split into batches
