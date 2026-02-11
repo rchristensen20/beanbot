@@ -7,6 +7,7 @@ import logging
 import base64
 import httpx
 from datetime import date, datetime, time, timedelta
+from urllib.parse import urlparse, urljoin
 from zoneinfo import ZoneInfo
 from langchain_core.messages import HumanMessage
 from bs4 import BeautifulSoup
@@ -17,7 +18,7 @@ BOT_TZ = ZoneInfo(os.getenv("BOT_TIMEZONE", "America/Denver"))
 from src.graph import init_graph
 import src.graph as graph_module
 # Import basic file reader for the daily report
-from src.services.tools import read_knowledge_file, get_open_tasks, find_related_files, search_file_contents, build_library_index, get_library_files, is_onboarding_complete, register_member, get_member_name_by_discord_id, list_members, get_tasks_for_user, get_clearable_knowledge_files, clear_all_knowledge_files, clear_entire_garden, delete_knowledge_file, complete_task, _sanitize_topic, SYSTEM_FILES, DATA_DIR
+from src.services.tools import read_knowledge_file, get_open_tasks, find_related_files, search_file_contents, build_library_index, get_library_files, is_onboarding_complete, register_member, get_member_name_by_discord_id, list_members, get_tasks_for_user, get_clearable_knowledge_files, clear_all_knowledge_files, clear_entire_garden, delete_knowledge_file, complete_task, filter_tasks_due_today_or_overdue, _sanitize_topic, SYSTEM_FILES, DATA_DIR
 from src.services.categorization import categorize_files, suggest_merges
 from src.services.weather import fetch_current_weather, fetch_forecast
 
@@ -26,8 +27,33 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("beanbot")
 
 DISCORD_MESSAGE_LIMIT = 2000
-INGESTION_CHUNK_SIZE = 50_000
+INGESTION_CHUNK_SIZE = int(os.getenv("INGESTION_CHUNK_SIZE", "50000"))
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "60"))
+URL_FETCH_TIMEOUT = float(os.getenv("URL_FETCH_TIMEOUT", "30"))
+MAX_INGEST_URLS = int(os.getenv("MAX_INGEST_URLS", "5"))
+MAX_RECAP_DAYS = int(os.getenv("MAX_RECAP_DAYS", "90"))
+MAX_CRAWL_LINKS = int(os.getenv("MAX_CRAWL_LINKS", "50"))
+CRAWL_CONCURRENCY = int(os.getenv("CRAWL_CONCURRENCY", "5"))
+
+# Schedule times (HH:MM in 24h format)
+_briefing_h, _briefing_m = os.getenv("BRIEFING_TIME", "08:00").split(":")
+BRIEFING_TIME = time(hour=int(_briefing_h), minute=int(_briefing_m), tzinfo=BOT_TZ)
+
+_debrief_h, _debrief_m = os.getenv("DEBRIEF_TIME", "20:00").split(":")
+DEBRIEF_TIME = time(hour=int(_debrief_h), minute=int(_debrief_m), tzinfo=BOT_TZ)
+
+_recap_h, _recap_m = os.getenv("WEEKLY_RECAP_TIME", "20:00").split(":")
+WEEKLY_RECAP_TIME = time(hour=int(_recap_h), minute=int(_recap_m), tzinfo=BOT_TZ)
+WEEKLY_RECAP_DAY = int(os.getenv("WEEKLY_RECAP_DAY", "6"))  # 0=Mon, 6=Sun
+
+_prune_h, _prune_m = os.getenv("DB_PRUNE_TIME", "03:00").split(":")
+DB_PRUNE_TIME = time(hour=int(_prune_h), minute=int(_prune_m), tzinfo=BOT_TZ)
+
+WEATHER_ALERT_INTERVAL_HOURS = int(os.getenv("WEATHER_ALERT_INTERVAL_HOURS", "6"))
+
+# Retention
+DB_PRUNE_RETENTION_DAYS = int(os.getenv("DB_PRUNE_RETENTION_DAYS", "7"))
+DB_PRUNE_MAX_CHECKPOINTS = int(os.getenv("DB_PRUNE_MAX_CHECKPOINTS", "20"))
 
 
 def _read_version() -> str:
@@ -268,8 +294,10 @@ class DebriefTaskView(discord.ui.View):
             result = complete_task(snippet_clean)
             completed_names.append(_extract_task_description(task_line))
 
-        # Rebuild the view with remaining open tasks
+        # Rebuild the view with remaining open tasks (filtered to today/overdue)
         remaining_tasks = get_open_tasks()
+        today = datetime.now(BOT_TZ).date().isoformat()
+        remaining_tasks = filter_tasks_due_today_or_overdue(remaining_tasks, today)
         summary = "\n".join(f"- ~~{name}~~" for name in completed_names)
 
         if remaining_tasks:
@@ -341,6 +369,135 @@ class ConfirmView(discord.ui.View):
                 pass
 
 
+class CrawlLinksView(discord.ui.View):
+    """Non-persistent, author-gated view offering to crawl discovered same-domain links."""
+
+    def __init__(self, bot: "BeanBot", links: list[str], original_urls: list[str], author_id: int, channel_id: str):
+        super().__init__(timeout=300)  # 5-minute timeout
+        self.bot = bot
+        self.links = links
+        self.original_urls = original_urls
+        self.author_id = author_id
+        self.channel_id = channel_id
+        self.message: discord.Message | None = None
+
+        crawl_btn = discord.ui.Button(
+            label=f"Crawl All ({len(links)} links)",
+            style=discord.ButtonStyle.primary,
+        )
+        skip_btn = discord.ui.Button(
+            label="Skip",
+            style=discord.ButtonStyle.secondary,
+        )
+
+        crawl_btn.callback = self._crawl_all
+        skip_btn.callback = self._skip
+
+        self.add_item(crawl_btn)
+        self.add_item(skip_btn)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "Only the person who posted the URL can use these buttons.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def _crawl_all(self, interaction: discord.Interaction):
+        total = len(self.links)
+        await interaction.response.edit_message(
+            content=f"Crawling {total} links...", view=None
+        )
+
+        # Fetch all URLs concurrently with a semaphore
+        semaphore = asyncio.Semaphore(CRAWL_CONCURRENCY)
+        results: dict[str, str | None] = {}
+
+        async def fetch_one(url: str):
+            async with semaphore:
+                try:
+                    content = await self.bot._fetch_url_content(url)
+                    return url, content
+                except Exception as e:
+                    logger.error(f"Crawl fetch failed for {url}: {e}")
+                    return url, None
+
+        tasks_list = [fetch_one(url) for url in self.links]
+        completed = 0
+        for coro in asyncio.as_completed(tasks_list):
+            url, content = await coro
+            results[url] = content
+            completed += 1
+            if completed % 5 == 0 or completed == total:
+                try:
+                    await interaction.message.edit(
+                        content=f"Fetching {completed}/{total} URLs..."
+                    )
+                except Exception:
+                    pass
+
+        # Separate successes and failures
+        successes = []
+        failed_count = 0
+        for url in self.links:
+            content = results.get(url)
+            if content and not content.startswith("[Error") and not content.startswith("[Unsupported"):
+                successes.append(f"--- Content from {url} ---\n{content}")
+            else:
+                failed_count += 1
+
+        if not successes:
+            await interaction.message.edit(
+                content=f"Could not fetch any of the {total} linked pages."
+            )
+            return
+
+        combined = "\n\n".join(successes)
+        chunks = BeanBot._chunk_text(combined)
+
+        total_chunks = len(chunks)
+        responses = []
+        for i, chunk in enumerate(chunks, 1):
+            response = await self.bot.process_llm_request(
+                chunk, "knowledge_ingest", thread_id=self.channel_id
+            )
+            responses.append(response)
+            try:
+                await interaction.message.edit(
+                    content=f"Processed {i}/{total_chunks} chunks..."
+                )
+            except Exception:
+                pass
+
+        fetched = total - failed_count
+        fail_note = f" ({failed_count} failed)" if failed_count else ""
+        await interaction.message.edit(
+            content=f"Done! Crawled {fetched} linked pages, ingested {total_chunks} chunk(s){fail_note}."
+        )
+
+        # Send LLM responses
+        summary = "\n".join(responses)
+        msg_chunks = BeanBot._chunk_text(summary, max_size=DISCORD_MESSAGE_LIMIT)
+        for chunk in msg_chunks:
+            await interaction.message.channel.send(chunk)
+
+    async def _skip(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            content="Skipped crawling linked pages.", view=None
+        )
+        self.stop()
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                await self.message.edit(
+                    content="Link crawl offer expired (5 min timeout).", view=None
+                )
+            except Exception:
+                pass
+
+
 class BeanBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -356,6 +513,7 @@ class BeanBot(commands.Bot):
         self.weather_api_key = os.getenv("OPENWEATHER_API_KEY")
         self.weather_lat = os.getenv("WEATHER_LAT")
         self.weather_lon = os.getenv("WEATHER_LON")
+        self.weather_units = os.getenv("WEATHER_UNITS", "metric")
         
         # Register commands
         @self.command(name="briefing")
@@ -644,12 +802,42 @@ class BeanBot(commands.Bot):
         url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
         return re.findall(url_pattern, text)
 
-    async def _fetch_url_content(self, url: str) -> str:
-        """Fetch and extract text from URL."""
+    @staticmethod
+    def _extract_same_domain_links(soup: BeautifulSoup, base_url: str) -> list[str]:
+        """Extract deduplicated same-domain links from a parsed HTML page."""
+        base_parsed = urlparse(base_url)
+        base_clean = base_parsed._replace(fragment='').geturl()
+        seen = set()
+        links = []
+
+        for a in soup.find_all('a', href=True):
+            href = a['href'].strip()
+            if not href or href.startswith(('#', 'mailto:', 'javascript:', 'tel:')):
+                continue
+
+            resolved = urljoin(base_url, href)
+            parsed = urlparse(resolved)
+
+            # Same domain only
+            if parsed.netloc != base_parsed.netloc:
+                continue
+
+            # Strip fragment, normalize
+            clean = parsed._replace(fragment='').geturl()
+            if clean == base_clean or clean in seen:
+                continue
+
+            seen.add(clean)
+            links.append(clean)
+
+        return links
+
+    async def _fetch_url_content(self, url: str, extract_links: bool = False) -> str | tuple[str, list[str]]:
+        """Fetch and extract text from URL. When extract_links=True, returns (text, links)."""
         headers = {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
-        async with httpx.AsyncClient(timeout=30.0, headers=headers) as client:
+        async with httpx.AsyncClient(timeout=URL_FETCH_TIMEOUT, headers=headers) as client:
             try:
                 resp = await client.get(url, follow_redirects=True)
                 resp.raise_for_status()
@@ -657,17 +845,22 @@ class BeanBot(commands.Bot):
 
                 if 'text/html' in content_type:
                     soup = BeautifulSoup(resp.text, 'html.parser')
+                    # Extract links BEFORE decomposing nav/footer
+                    links = self._extract_same_domain_links(soup, str(resp.url)) if extract_links else []
                     # Remove scripts, styles, nav, footer
                     for tag in soup(['script', 'style', 'nav', 'footer', 'header']):
                         tag.decompose()
-                    return soup.get_text(separator='\n', strip=True)
+                    text = soup.get_text(separator='\n', strip=True)
+                    return (text, links) if extract_links else text
                 elif 'text/' in content_type or url.endswith(('.md', '.txt')):
-                    return resp.text
+                    return (resp.text, []) if extract_links else resp.text
                 else:
-                    return f"[Unsupported content type: {content_type}]"
+                    msg = f"[Unsupported content type: {content_type}]"
+                    return (msg, []) if extract_links else msg
             except Exception as e:
                 logger.error(f"Failed to fetch {url}: {e}")
-                return f"[Error fetching URL: {e}]"
+                msg = f"[Error fetching URL: {e}]"
+                return (msg, []) if extract_links else msg
 
     @staticmethod
     def _extract_pdf_text(pdf_bytes: bytes, filename: str) -> str:
@@ -760,12 +953,17 @@ class BeanBot(commands.Bot):
                 # Add non-image, non-PDF attachment URLs
                 urls.extend([att.url for att in other_attachments])
 
+                all_discovered_links = []
+                fetched_urls = set()
+
                 if urls:
-                    # Fetch URL content
+                    # Fetch URL content and discover same-domain links
                     contents = []
-                    for url in urls[:5]:
-                        content = await self._fetch_url_content(url)
+                    for url in urls[:MAX_INGEST_URLS]:
+                        content, links = await self._fetch_url_content(url, extract_links=True)
                         contents.append(f"--- Content from {url} ---\n{content}")
+                        all_discovered_links.extend(links)
+                        fetched_urls.add(url)
                     combined = "\n\n".join(pdf_texts + contents)
                 elif message.content.strip() or image_data or pdf_texts:
                     # Plain text message, images, and/or PDF content
@@ -793,6 +991,40 @@ class BeanBot(commands.Bot):
                     await progress_msg.edit(content=f"Done! Ingested {total} parts.")
                     summary = "\n".join(responses)
                     await self._send_long_reply(message, summary)
+
+            # Offer to crawl discovered links (outside typing block)
+            if all_discovered_links:
+                # Deduplicate and exclude already-fetched URLs
+                seen = set()
+                unique_links = []
+                for link in all_discovered_links:
+                    if link not in seen and link not in fetched_urls:
+                        seen.add(link)
+                        unique_links.append(link)
+
+                unique_links = unique_links[:MAX_CRAWL_LINKS]
+
+                if unique_links:
+                    # Build the link preview (show first 5, summarize rest)
+                    preview_lines = [f"  - {link}" for link in unique_links[:5]]
+                    preview = "\n".join(preview_lines)
+                    if len(unique_links) > 5:
+                        preview += f"\n  ... and {len(unique_links) - 5} more"
+
+                    crawl_view = CrawlLinksView(
+                        bot=self,
+                        links=unique_links,
+                        original_urls=list(fetched_urls),
+                        author_id=message.author.id,
+                        channel_id=str(message.channel.id),
+                    )
+                    crawl_msg = await message.channel.send(
+                        f"Found **{len(unique_links)}** same-domain links on that page:\n{preview}\n\n"
+                        f"Would you like me to crawl and ingest them too?",
+                        view=crawl_view,
+                    )
+                    crawl_view.message = crawl_msg
+
             return
 
         if is_journal or is_question or is_dm or is_mention:
@@ -898,7 +1130,7 @@ class BeanBot(commands.Bot):
                 return "I've hit my API usage limit — please wait a few minutes before sending another message. I'll be back shortly!"
             return "I encountered an error processing your request."
 
-    @tasks.loop(time=time(hour=8, minute=0, tzinfo=BOT_TZ))
+    @tasks.loop(time=BRIEFING_TIME)
     async def daily_report(self):
         if self.reminders_channel_id == 0:
             return
@@ -914,10 +1146,10 @@ class BeanBot(commands.Bot):
         logger.info("Generating daily report...")
 
         # Pre-read knowledge files directly
-        weather_data = await fetch_current_weather(self.weather_api_key, self.weather_lat, self.weather_lon)
-        forecast = await fetch_forecast(self.weather_api_key, self.weather_lat, self.weather_lon)
+        weather_data = await fetch_current_weather(self.weather_api_key, self.weather_lat, self.weather_lon, self.weather_units)
+        forecast = await fetch_forecast(self.weather_api_key, self.weather_lat, self.weather_lon, self.weather_units)
 
-        today = date.today().isoformat()
+        today = datetime.now(BOT_TZ).date().isoformat()
 
         # Build forecast guidance for the LLM
         forecast_guidance = ""
@@ -1203,6 +1435,8 @@ class BeanBot(commands.Bot):
         """Send the debrief prompt with open tasks, a task-completion Select, and the debrief button."""
         logger.info("Sending daily debrief prompt...")
 
+        today = datetime.now(BOT_TZ).date().isoformat()
+
         if user_id:
             # Manual !debrief — show the calling user's tasks + unassigned
             user_name = get_member_name_by_discord_id(user_id)
@@ -1217,14 +1451,17 @@ class BeanBot(commands.Bot):
             open_tasks = get_open_tasks()
             label = "Open tasks"
 
+        # Filter to only today's and overdue tasks (+ tasks with no due date)
+        open_tasks = filter_tasks_due_today_or_overdue(open_tasks, today)
+
         if open_tasks:
             task_display = "\n".join(
                 f"- {_extract_task_description(t)}" for t in open_tasks
             )
-            msg = f"**Evening Debrief — {date.today().isoformat()}**\n\n{label}:\n{task_display}\n\nSelect completed tasks below, then click **Mark Complete**. When you're done, click **Log Today's Debrief**."
+            msg = f"**Evening Debrief — {today}**\n\n{label}:\n{task_display}\n\nSelect completed tasks below, then click **Mark Complete**. When you're done, click **Log Today's Debrief**."
             view = DebriefTaskView(self, open_tasks)
         else:
-            msg = f"**Evening Debrief — {date.today().isoformat()}**\n\nNo open tasks. Click below to log what you did today."
+            msg = f"**Evening Debrief — {today}**\n\nNo open tasks. Click below to log what you did today."
             view = DebriefView(self)
 
         if len(msg) <= DISCORD_MESSAGE_LIMIT:
@@ -1235,7 +1472,7 @@ class BeanBot(commands.Bot):
                 await channel.send(chunk)
             await channel.send(chunks[-1], view=view)
 
-    @tasks.loop(time=time(hour=20, minute=0, tzinfo=BOT_TZ))
+    @tasks.loop(time=DEBRIEF_TIME)
     async def daily_debrief(self):
         if self.journal_channel_id == 0:
             return
@@ -1253,7 +1490,7 @@ class BeanBot(commands.Bot):
 
     # --- Weather Alerts (every 6 hours) ---
 
-    @tasks.loop(hours=6)
+    @tasks.loop(hours=WEATHER_ALERT_INTERVAL_HOURS)
     async def weather_alerts(self):
         if self.reminders_channel_id == 0:
             return
@@ -1262,13 +1499,13 @@ class BeanBot(commands.Bot):
         if not channel:
             return
 
-        forecast = await fetch_forecast(self.weather_api_key, self.weather_lat, self.weather_lon)
+        forecast = await fetch_forecast(self.weather_api_key, self.weather_lat, self.weather_lon, self.weather_units)
         if not forecast.get("frost_risk") and not forecast.get("rain_alert"):
             return
 
         # Deduplicate: max one alert per day via flag file
         flag_path = os.path.join("data", ".alert_flag")
-        today = date.today().isoformat()
+        today = datetime.now(BOT_TZ).date().isoformat()
         try:
             if os.path.exists(flag_path):
                 with open(flag_path) as f:
@@ -1278,16 +1515,18 @@ class BeanBot(commands.Bot):
             pass
 
         # Build alert message
+        temp_label = "°F" if self.weather_units == "imperial" else "°C"
+        precip_label = "in" if self.weather_units == "imperial" else "mm"
         parts = ["**⚠ Weather Alert**"]
         if forecast.get("frost_risk"):
             parts.append(
-                f"🥶 **Frost risk** — temps dropping to {forecast.get('min_temp_c', '?'):.0f}°C in the next 48 hours. "
+                f"🥶 **Frost risk** — temps dropping to {forecast.get('min_temp', '?'):.0f}{temp_label} in the next 48 hours. "
                 "Consider covering sensitive plants and bringing in tender seedlings."
             )
         if forecast.get("rain_alert"):
             parts.append(
                 f"🌧 **Rain expected** — up to {forecast.get('max_rain_prob', 0):.0f}% chance, "
-                f"{forecast.get('max_rain_mm', 0):.1f}mm total. You may be able to skip watering."
+                f"{forecast.get('max_rain_mm', 0):.1f}{precip_label} total. You may be able to skip watering."
             )
 
         await channel.send("\n".join(parts))
@@ -1313,7 +1552,7 @@ class BeanBot(commands.Bot):
             await ctx.send("This command can only be used in the reminders, journal, or questions channel.")
             return
 
-        days = max(1, min(days, 90))  # clamp to reasonable range
+        days = max(1, min(days, MAX_RECAP_DAYS))
         await ctx.send(f"Generating {days}-day garden recap...")
         await self.run_recap_logic(ctx.channel, days, reply_message=ctx.message)
 
@@ -1345,11 +1584,11 @@ class BeanBot(commands.Bot):
             for chunk in chunks[1:]:
                 await channel.send(chunk)
 
-    @tasks.loop(time=time(hour=20, minute=0, tzinfo=BOT_TZ))
+    @tasks.loop(time=WEEKLY_RECAP_TIME)
     async def weekly_recap(self):
-        """Post a weekly recap every Sunday at 8pm MT."""
+        """Post a weekly recap on the configured day."""
         now = datetime.now(BOT_TZ)
-        if now.weekday() != 6:  # 6 = Sunday
+        if now.weekday() != WEEKLY_RECAP_DAY:
             return
 
         if self.reminders_channel_id == 0:
@@ -1369,7 +1608,7 @@ class BeanBot(commands.Bot):
 
     # --- Database Checkpoint Pruning (nightly at 3 AM) ---
 
-    @tasks.loop(time=time(hour=3, minute=0, tzinfo=BOT_TZ))
+    @tasks.loop(time=DB_PRUNE_TIME)
     async def db_prune(self):
         """Nightly pruning of old conversation checkpoints."""
         await self._run_db_prune()
@@ -1383,7 +1622,7 @@ class BeanBot(commands.Bot):
         import aiosqlite
         from src.graph import DB_PATH
 
-        cutoff = (date.today() - timedelta(days=7)).isoformat()
+        cutoff = (datetime.now(BOT_TZ).date() - timedelta(days=DB_PRUNE_RETENTION_DAYS)).isoformat()
 
         try:
             async with aiosqlite.connect(DB_PATH) as conn:
@@ -1420,8 +1659,8 @@ class BeanBot(commands.Bot):
                     # Get the 20th newest checkpoint_id as cutoff
                     cursor = await conn.execute(
                         "SELECT checkpoint_id FROM checkpoints "
-                        "WHERE thread_id = ? ORDER BY checkpoint_id DESC LIMIT 1 OFFSET 19",
-                        (tid,),
+                        "WHERE thread_id = ? ORDER BY checkpoint_id DESC LIMIT 1 OFFSET ?",
+                        (tid, DB_PRUNE_MAX_CHECKPOINTS - 1),
                     )
                     row = await cursor.fetchone()
                     if row:
