@@ -55,10 +55,10 @@ def tool_update_journal(entry: str):
     return update_journal(entry)
 
 @tool
-def tool_amend_knowledge(topic: str, content: str):
-    """Updates a specific topic file with new notes/facts. Args: topic (e.g. 'garlic'), content (text)"""
-    logger.info(f"tool_amend_knowledge called: topic={topic!r}, content_len={len(content)}")
-    result = amend_topic_knowledge(topic, content)
+def tool_amend_knowledge(topic: str, content: str, source: str = ""):
+    """Updates a specific topic file with new notes/facts. Pass 'source' when you know where the info came from (URL, PDF filename, 'Discord message', 'image'). Args: topic (e.g. 'garlic'), content (text), source (optional provenance string)"""
+    logger.info(f"tool_amend_knowledge called: topic={topic!r}, content_len={len(content)}, source={source!r}")
+    result = amend_topic_knowledge(topic, content, source)
     logger.info(f"tool_amend_knowledge result: {result}")
     return result
 
@@ -193,7 +193,7 @@ STATIC_SYSTEM_PROMPT = (
     "You have access to a knowledge library, but you must read the files to see their content.\n"
     "TOOLS:\n"
     "- 'tool_read_file': Read content.\n"
-    "- 'tool_amend_knowledge': Add or update knowledge about a topic. Creates the file if it doesn't exist, appends if it does.\n"
+    "- 'tool_amend_knowledge': Add or update knowledge about a topic. Creates the file if it doesn't exist, appends if it does. Pass the 'source' arg when you know where the info came from (URL, PDF filename, 'Discord message', 'image').\n"
     "- 'tool_add_task': Schedule a reminder.\n"
     "- 'tool_log_harvest': Record yields.\n"
     "- 'tool_complete_task': Mark a task as done. Args: substring of task description.\n"
@@ -246,6 +246,19 @@ STATIC_SYSTEM_PROMPT = (
     "ALWAYS read 'farm_layout.md' first so you can merge new info with existing content.\n"
     "- For plant photos: Identify the plant/issue and respond conversationally.\n"
     "- For area photos with captions: Update the relevant section of 'farm_layout.md'.\n"
+    "SOURCE TRACKING:\n"
+    "- ALWAYS pass the 'source' argument when calling tool_amend_knowledge during ingestion.\n"
+    "- For URLs: pass the full URL (e.g. source='https://extension.colostate.edu/garlic-guide/').\n"
+    "- For PDFs: pass the PDF filename (e.g. source='seed_catalog.pdf'). Parse it from the '--- Content from <filename> ---' header.\n"
+    "- For plain Discord text: pass source='Discord message'.\n"
+    "- For images: pass source='image'.\n"
+    "- When a user asks 'where did I learn this?' or 'what are my sources for X?', read the topic file and look at the '## Sources' section at the bottom.\n"
+    "CONFLICT FLAGGING:\n"
+    "- When amending a topic file that already exists, READ IT FIRST with tool_read_file.\n"
+    "- If the new information genuinely contradicts existing facts (different numbers, dates, spacing, "
+    "or recommendations), include a conflict note in the content you pass to tool_amend_knowledge:\n"
+    "  > **Conflict:** Previous entry says X, but this source says Y. Verify for your zone.\n"
+    "- Only flag genuine contradictions, not minor wording differences or complementary information.\n"
 )
 
 

@@ -20,6 +20,63 @@ def _sanitize_topic(topic: str) -> str:
     return "".join(c for c in topic if c.isalnum() or c in (' ', '_', '-')).strip().lower().replace(' ', '_')
 
 
+def _classify_source(source: str) -> str:
+    """Classify a source string and return a formatted bullet with a quality hint tag.
+
+    Examples:
+        "https://extension.colostate.edu/garlic" -> "https://extension.colostate.edu/garlic (extension)"
+        "https://www.nrcs.usda.gov/soils"       -> "https://www.nrcs.usda.gov/soils (government)"
+        "https://www.rhs.org.uk/plants"          -> "https://www.rhs.org.uk/plants (organization)"
+        "https://example.com/tips"               -> "https://example.com/tips (web)"
+        "seed_catalog.pdf"                        -> "seed_catalog.pdf (PDF)"
+        "Discord message"                         -> "Discord message (Discord)"
+        "image"                                   -> "image (image)"
+    """
+    s = source.strip()
+    lower = s.lower()
+
+    if lower.startswith("http://") or lower.startswith("https://"):
+        if ".edu" in lower:
+            return f"{s} (extension)"
+        if ".gov" in lower:
+            return f"{s} (government)"
+        if ".org" in lower:
+            return f"{s} (organization)"
+        return f"{s} (web)"
+    if lower.endswith(".pdf"):
+        return f"{s} (PDF)"
+    if lower == "discord message":
+        return f"{s} (Discord)"
+    if lower == "image":
+        return f"{s} (image)"
+    # Fallback — return as-is
+    return s
+
+
+def _split_sources_section(content: str) -> tuple[str, list[str]]:
+    """Split file content into (body, source_lines) at the '## Sources' header.
+
+    Returns:
+        (body text without the sources section, list of individual source lines).
+        Source lines have leading '- ' stripped.
+    """
+    marker = "\n## Sources\n"
+    idx = content.find(marker)
+    if idx == -1:
+        return content, []
+
+    body = content[:idx]
+    sources_block = content[idx + len(marker):]
+    source_lines = []
+    for line in sources_block.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            source_lines.append(stripped[2:])
+        elif stripped:
+            source_lines.append(stripped)
+    return body, source_lines
+
+
 def _list_md_paths(exclude_system: bool = True, exclude_daily: bool = True) -> list[str]:
     """List markdown file paths in the data directory, with optional filtering."""
     paths = glob.glob(os.path.join(DATA_DIR, "*.md"))
@@ -153,30 +210,49 @@ def update_journal(entry: str) -> str:
         logger.error(f"Failed to write to {path}: {e}")
         return f"Error writing to file: {str(e)}"
 
-def amend_topic_knowledge(topic: str, content: str) -> str:
+def amend_topic_knowledge(topic: str, content: str, source: str = "") -> str:
     """
     Appends knowledge or notes to a specific topic file. Creates the file if it doesn't exist.
     Use this when the user mentions specific facts about a plant or subject that should be remembered long-term.
-    
+
     Args:
         topic: The topic name, which becomes the filename (e.g., 'garlic' -> 'garlic.md').
         content: The note or fact to append.
+        source: Optional provenance string (URL, PDF filename, 'Discord message', 'image').
     """
     safe_topic = _sanitize_topic(topic)
     filename = f"{safe_topic}.md"
     path = os.path.join(DATA_DIR, filename)
-    
+
     timestamp = datetime.now().strftime("%Y-%m-%d")
-    formatted_entry = f"\n\n### Update {timestamp}\n{content}"
-    
+    new_block = f"\n\n### Update {timestamp}\n{content}"
+
     try:
-        if not os.path.exists(path):
-            with open(path, "w") as f:
-                f.write(f"# {safe_topic.replace('_', ' ').title()}\n")
-        
-        with open(path, "a") as f:
-            f.write(formatted_entry)
-            
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                existing = f.read()
+            body, existing_sources = _split_sources_section(existing)
+        else:
+            body = f"# {safe_topic.replace('_', ' ').title()}\n"
+            existing_sources = []
+
+        body += new_block
+
+        # Add new source (deduplicated)
+        if source.strip():
+            classified = _classify_source(source)
+            if classified not in existing_sources:
+                existing_sources.append(classified)
+
+        # Rebuild file: body + sources section
+        if existing_sources:
+            sources_block = "\n## Sources\n" + "\n".join(f"- {s}" for s in existing_sources) + "\n"
+        else:
+            sources_block = ""
+
+        with open(path, "w") as f:
+            f.write(body + sources_block)
+
         return f"Successfully updated knowledge for '{safe_topic}'."
     except Exception as e:
         logger.error(f"Failed to write to {path}: {e}")
@@ -280,7 +356,10 @@ def generate_calendar_from_library() -> str:
         try:
             with open(file_path, "r") as f:
                 content = f.read()
-                
+
+            # Strip ## Sources section so URLs don't get parsed as planting data
+            content, _ = _split_sources_section(content)
+
             # Regex heuristics for planting info
             spring_match = re.search(r"\*\*Spring Planting Dates.*?\*\*(.*?)(?=\*\*Fall|\Z)", content, re.DOTALL)
             fall_match = re.search(r"\*\*Fall Planting Dates.*?\*\*(.*?)(?=\n###|\Z)", content, re.DOTALL)
