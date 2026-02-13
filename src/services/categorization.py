@@ -33,47 +33,61 @@ def _extract_json(text: str) -> dict | list:
     return json.loads(text)
 
 
-async def _categorize_batch(model, batch: list[dict]) -> dict[str, list[str]]:
-    """Categorize a single batch of files. Returns {category: [filenames]}."""
+async def _categorize_batch(model, batch: list[dict]) -> dict[str, dict[str, list[str]]]:
+    """Categorize a single batch of files. Returns {category: {species: [filenames]}}."""
     file_list = "\n".join(
         f"{e['filename']}|{e['title']}" for e in batch
     )
 
     prompt = (
-        "You are a botanical and gardening expert. Categorize each file below into ONE category.\n\n"
+        "You are a botanical and gardening expert. Categorize each file below into ONE category AND one species/topic.\n\n"
         "CATEGORIES (use these, add others only if truly needed):\n"
         "Trees, Shrubs, Vegetables, Herbs, Flowers, Fruits, Grasses/Grains, Vines, "
         "Groundcovers, Wildflowers/Native Plants, Wildlife, Farm/Infrastructure, "
         "Techniques/Methods, Uncategorized\n\n"
         "RULES:\n"
         "- Use botanical knowledge (e.g. smooth_sumac=Shrubs, cherry_tomato=Vegetables, lavender=Herbs)\n"
-        "- Every file gets exactly one category\n"
+        "- Every file gets exactly one category and one species/topic\n"
+        "- Species should be the common plant name that groups related files together\n"
+        "  e.g. garlic.md + garlic_care.md + garlic_pests.md all get Species=Garlic\n"
+        "  e.g. cherry_tomato.md + tomato_varieties.md + tomato.md all get Species=Tomato\n"
+        "- Use singular form, title case (Garlic not garlics, Tomato not tomatoes)\n"
+        "- For non-plant files, use a short descriptive topic (e.g. Composting, Irrigation, Raised Beds)\n"
         "- Uncategorized is a last resort\n\n"
         "INPUT (filename|title):\n"
         f"{file_list}\n\n"
-        "OUTPUT: One line per file, same order as input, format: filename|Category\n"
-        "No headers, no explanation, no blank lines. ONLY the filename|Category lines."
+        "OUTPUT: One line per file, same order as input, format: filename|Category|Species\n"
+        "No headers, no explanation, no blank lines. ONLY the filename|Category|Species lines."
     )
 
     response = await model.ainvoke([HumanMessage(content=prompt)])
     text = response.content if isinstance(response.content, str) else str(response.content)
 
-    categories: dict[str, list[str]] = {}
+    categories: dict[str, dict[str, list[str]]] = {}
     for line in text.strip().splitlines():
         line = line.strip()
         if "|" not in line:
             continue
-        parts = line.split("|", 1)
-        filename = parts[0].strip()
-        category = parts[1].strip()
-        if not filename or not category:
+        parts = line.split("|")
+        if len(parts) >= 3:
+            filename = parts[0].strip()
+            category = parts[1].strip()
+            species = parts[2].strip()
+        elif len(parts) == 2:
+            filename = parts[0].strip()
+            category = parts[1].strip()
+            # Fallback: derive species from filename stem
+            species = filename.replace(".md", "").replace("_", " ").title()
+        else:
             continue
-        categories.setdefault(category, []).append(filename)
+        if not filename or not category or not species:
+            continue
+        categories.setdefault(category, {}).setdefault(species, []).append(filename)
 
     return categories
 
 
-async def categorize_files(file_entries: list[dict], progress_callback=None) -> dict[str, list[str]]:
+async def categorize_files(file_entries: list[dict], progress_callback=None) -> dict[str, dict[str, list[str]]]:
     """Categorize knowledge files in batches to avoid output token limits.
 
     Args:
@@ -81,7 +95,7 @@ async def categorize_files(file_entries: list[dict], progress_callback=None) -> 
         progress_callback: optional async function(batch_num, total_batches) for progress updates.
 
     Returns:
-        dict mapping category names to lists of filenames.
+        dict mapping category names to {species: [filenames]} dicts.
     """
     model = ChatGoogleGenerativeAI(
         model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
@@ -108,19 +122,52 @@ async def categorize_files(file_entries: list[dict], progress_callback=None) -> 
         *(run_batch(i, b) for i, b in enumerate(batches))
     )
 
-    # Merge all batch results
-    categories: dict[str, list[str]] = {}
+    # Merge all batch results (nested: {cat: {species: [files]}})
+    categories: dict[str, dict[str, list[str]]] = {}
     for batch_cats in batch_results:
-        for cat, files in batch_cats.items():
-            categories.setdefault(cat, []).extend(files)
+        for cat, species_dict in batch_cats.items():
+            cat_entry = categories.setdefault(cat, {})
+            for species, files in species_dict.items():
+                cat_entry.setdefault(species, []).extend(files)
 
-    total_categorized = sum(len(files) for files in categories.values())
-    logger.info(f"Categorization complete: {len(categories)} categories, {total_categorized}/{len(file_entries)} files categorized")
+    total_categorized = sum(
+        len(files) for species_dict in categories.values() for files in species_dict.values()
+    )
+    total_species = sum(len(species_dict) for species_dict in categories.values())
+    logger.info(f"Categorization complete: {len(categories)} categories, {total_species} species, {total_categorized}/{len(file_entries)} files categorized")
 
     if total_categorized == 0:
         raise ValueError("No files were categorized across any batch")
 
     return categories
+
+
+def derive_merge_suggestions(categories: dict[str, dict[str, list[str]]]) -> list[dict]:
+    """Derive merge candidates deterministically: any species with 2+ files is a candidate.
+
+    Args:
+        categories: nested dict {category: {species: [filenames]}}.
+
+    Returns:
+        list of {"target": "file.md", "files": [...], "species": str, "category": str} dicts,
+        sorted by file count descending.
+    """
+    suggestions = []
+    for cat, species_dict in sorted(categories.items()):
+        for species, files in sorted(species_dict.items()):
+            if len(files) >= 2:
+                target_stem = species.lower().replace(" ", "_")
+                target = f"{target_stem}.md"
+                if target not in files:
+                    target = sorted(files)[0]
+                suggestions.append({
+                    "target": target,
+                    "files": sorted(files),
+                    "species": species,
+                    "category": cat,
+                })
+    suggestions.sort(key=lambda s: -len(s["files"]))
+    return suggestions
 
 
 async def suggest_merges(categories: dict[str, list[str]]) -> list[dict]:

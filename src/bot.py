@@ -19,7 +19,7 @@ from src.graph import init_graph
 import src.graph as graph_module
 # Import basic file reader for the daily report
 from src.services.tools import read_knowledge_file, get_open_tasks, find_related_files, search_file_contents, build_library_index, get_library_files, is_onboarding_complete, register_member, get_member_name_by_discord_id, list_members, get_tasks_for_user, get_clearable_knowledge_files, clear_all_knowledge_files, clear_entire_garden, delete_knowledge_file, complete_task, filter_tasks_due_today_or_overdue, _sanitize_topic, SYSTEM_FILES, DATA_DIR
-from src.services.categorization import categorize_files, suggest_merges
+from src.services.categorization import categorize_files, derive_merge_suggestions
 from src.services.weather import fetch_current_weather, fetch_forecast
 
 # Configure logging
@@ -106,9 +106,17 @@ CHANNEL_CONTEXT = {
         "[CONTEXT: User is posting content to INGEST into the knowledge library.\n"
         "Your job:\n"
         "1. Identify all gardening/permaculture topics mentioned (plant names, techniques, etc.)\n"
-        "2. For EACH topic, call tool_amend_knowledge with the topic name and relevant facts\n"
-        "3. Be thorough - extract cultivar info, planting dates, care tips, companion plants, etc.\n"
-        "4. When done, reply with ONLY a short confirmation (under 500 chars): list the file names updated and a one-line summary. Do NOT repeat the ingested content back.]\n\n"
+        "2. For EACH topic, use the BROADEST/SIMPLEST topic name — prefer 'garlic' over 'garlic_growing_tips', "
+        "'tomato' over 'cherry_tomato_care'. This keeps related info in one file instead of fragmenting.\n"
+        "3. Call tool_amend_knowledge with the topic name and relevant facts\n"
+        "4. Be thorough - extract cultivar info, planting dates, care tips, companion plants, etc.\n"
+        "5. When extracting planting dates, use headers like '**Spring Planting Dates:**' and "
+        "'**Fall Planting Dates:**' so the planting calendar generator can parse them.\n"
+        "6. Reply with a short confirmation (under 500 chars): list the TOPICS updated by name "
+        "(e.g. 'Garlic, Tomato, Companion Planting') and a one-line summary. "
+        "Do NOT reference filenames or repeat the ingested content.\n"
+        "7. On the very last line of your reply, write exactly: TOPICS: topic1, topic2, topic3 "
+        "(matching the topic names you passed to tool_amend_knowledge). This line is parsed by the system.]\n\n"
     ),
     "onboarding": (
         "[CONTEXT: This is a NEW USER ONBOARDING session via DM. Guide them through setup step by step.\n"
@@ -498,6 +506,114 @@ class CrawlLinksView(discord.ui.View):
                 pass
 
 
+class CalendarTaskView(discord.ui.View):
+    """Non-persistent, author-gated view offering to update planting calendar and create tasks after ingestion."""
+
+    def __init__(self, bot: "BeanBot", ingested_files: list[str], author_id: int):
+        super().__init__(timeout=300)  # 5-minute timeout
+        self.bot = bot
+        self.ingested_files = ingested_files
+        self.author_id = author_id
+        self.message: discord.Message | None = None
+
+        # Build Select menu from ingested filenames (Discord caps at 25 options)
+        options = []
+        for i, filename in enumerate(ingested_files[:25]):
+            label = filename.removesuffix(".md").replace("_", " ").title()[:100]
+            options.append(discord.SelectOption(label=label, value=str(i), default=True))
+
+        select = discord.ui.Select(
+            placeholder="Select topics to include...",
+            min_values=1,
+            max_values=len(options),
+            options=options,
+        )
+        select.callback = self._select_callback
+        self._select = select
+        self.add_item(select)
+
+        update_btn = discord.ui.Button(
+            label="Update Calendar & Create Tasks",
+            style=discord.ButtonStyle.success,
+        )
+        skip_btn = discord.ui.Button(
+            label="Skip",
+            style=discord.ButtonStyle.secondary,
+        )
+
+        update_btn.callback = self._update_calendar_tasks
+        skip_btn.callback = self._skip
+
+        self.add_item(update_btn)
+        self.add_item(skip_btn)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "Only the person who posted the content can use these buttons.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def _select_callback(self, interaction: discord.Interaction):
+        # Just acknowledge — selections are stored on the Select widget
+        await interaction.response.defer()
+
+    async def _update_calendar_tasks(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            content="Updating planting calendar and creating tasks...", view=None
+        )
+
+        selected_indices = [int(v) for v in self._select.values]
+        selected_files = [self.ingested_files[i] for i in selected_indices]
+        files_str = ", ".join(selected_files)
+        today = date.today().isoformat()
+        prompt = (
+            "[CONTEXT: POST-INGESTION CALENDAR & TASK UPDATE.]\n\n"
+            f"The following knowledge topics were just ingested: {files_str}\n\n"
+            "Your job:\n"
+            "1. Read these files using tool_read_multiple_files to review the ingested content.\n"
+            "2. Read 'almanac.md' for the user's zone, frost dates, and growing season.\n"
+            "3. Read 'farm_layout.md' for available beds/zones and current plantings.\n"
+            "4. Read 'tasks.md' to check for existing tasks and avoid duplicates.\n"
+            "5. Search for relevant technique/method files (e.g. seed starting, companion planting, "
+            "soil amendment) using tool_find_related_files and note useful cross-references.\n"
+            "6. Call tool_generate_calendar to rebuild the planting calendar with the new data.\n"
+            "7. For each plant with actionable planting dates in the current or upcoming season:\n"
+            "   - Create tasks via tool_add_task with specific due dates.\n"
+            "   - Reference bed locations from farm_layout.md when possible.\n"
+            "   - Include relevant technique tips in the task description.\n"
+            "   - Do NOT create tasks for dates that have already passed (use tool_get_date).\n"
+            "8. Reply with a summary: which plants were added to the calendar, what tasks were "
+            "created, and any relevant technique cross-references. Do NOT reference filenames — "
+            "refer to things by topic name (e.g. 'the planting calendar' not 'planting_calendar.md')."
+        )
+
+        ephemeral_thread_id = f"calendar_task_{today}"
+        response = await self.bot.process_llm_request(
+            prompt, "questions", thread_id=ephemeral_thread_id
+        )
+
+        chunks = BeanBot._chunk_text(response, max_size=DISCORD_MESSAGE_LIMIT)
+        for chunk in chunks:
+            await interaction.message.channel.send(chunk)
+
+    async def _skip(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            content="Skipped calendar and task update.", view=None
+        )
+        self.stop()
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                await self.message.edit(
+                    content="Calendar/task offer expired (5 min timeout).", view=None
+                )
+            except Exception:
+                pass
+
+
 class BeanBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -803,6 +919,35 @@ class BeanBot(commands.Bot):
         return re.findall(url_pattern, text)
 
     @staticmethod
+    def _extract_ingested_topics(text: str) -> tuple[list[str], str]:
+        """Extract topic names from TOPICS: footer(s), return (filenames, cleaned_text).
+
+        Handles multiple TOPICS: lines (from multi-chunk ingestion).
+
+        Returns:
+            (deduplicated list of derived filenames, response text with TOPICS: lines stripped)
+        """
+        lines = text.rstrip().split("\n")
+        all_topics = []
+        cleaned_lines = []
+        for line in lines:
+            if line.strip().startswith("TOPICS:"):
+                raw = line.strip()[len("TOPICS:"):].strip()
+                all_topics.extend(t.strip() for t in raw.split(",") if t.strip())
+            else:
+                cleaned_lines.append(line)
+        cleaned = "\n".join(cleaned_lines).rstrip()
+        if not all_topics:
+            return [], cleaned
+        # Same logic as _sanitize_topic() in tools.py
+        filenames = []
+        for t in all_topics:
+            stem = "".join(c for c in t if c.isalnum() or c in (' ', '_', '-')).strip().lower().replace(' ', '_')
+            if stem:
+                filenames.append(f"{stem}.md")
+        return list(dict.fromkeys(filenames)), cleaned
+
+    @staticmethod
     def _extract_same_domain_links(soup: BeautifulSoup, base_url: str) -> list[str]:
         """Extract deduplicated same-domain links from a parsed HTML page."""
         base_parsed = urlparse(base_url)
@@ -928,6 +1073,7 @@ class BeanBot(commands.Bot):
             if ctx.valid:
                 await self.process_commands(message)
                 return
+            ingested_files = []
             async with message.channel.typing():
                 # Extract image attachments separately
                 image_data = await self._extract_images(message)
@@ -977,6 +1123,7 @@ class BeanBot(commands.Bot):
 
                 if len(chunks) == 1:
                     response = await self.process_llm_request(chunks[0], "knowledge_ingest", thread_id=str(message.channel.id), images=image_data)
+                    ingested_files, response = self._extract_ingested_topics(response)
                     await self._send_long_reply(message, response)
                 else:
                     total = len(chunks)
@@ -990,7 +1137,22 @@ class BeanBot(commands.Bot):
                         await progress_msg.edit(content=f"Processed {i}/{total} parts...")
                     await progress_msg.edit(content=f"Done! Ingested {total} parts.")
                     summary = "\n".join(responses)
+                    ingested_files, summary = self._extract_ingested_topics(summary)
                     await self._send_long_reply(message, summary)
+
+            # Offer to update calendar & create tasks from ingested content
+            if ingested_files:
+                calendar_view = CalendarTaskView(
+                    bot=self,
+                    ingested_files=ingested_files,
+                    author_id=message.author.id,
+                )
+                cal_msg = await message.channel.send(
+                    "Would you like me to update the planting calendar and create tasks "
+                    "from the ingested content?",
+                    view=calendar_view,
+                )
+                calendar_view.message = cal_msg
 
             # Offer to crawl discovered links (outside typing block)
             if all_discovered_links:
@@ -1296,7 +1458,14 @@ class BeanBot(commands.Bot):
                 return
 
             file_list = "\n".join(f"- `{f}`" for f in all_files)
-            await ctx.send(f"**Consolidating '{topic}'** — found {len(all_files)} file(s):\n{file_list}\n\nWorking...")
+            full_msg = f"**Consolidating '{topic}'** — found {len(all_files)} file(s):\n{file_list}\n\nWorking..."
+            if len(full_msg) <= DISCORD_MESSAGE_LIMIT:
+                await ctx.send(full_msg)
+            else:
+                chunks = self._chunk_text(f"**Consolidating '{topic}'** — found {len(all_files)} file(s):\n{file_list}", max_size=DISCORD_MESSAGE_LIMIT)
+                for chunk in chunks:
+                    await ctx.send(chunk)
+                await ctx.send("Working...")
 
             filenames_str = ", ".join(all_files)
             prompt = (
@@ -1328,8 +1497,8 @@ class BeanBot(commands.Bot):
             return f"{size_bytes} B"
         return f"{size_bytes / 1024:.1f} KB"
 
-    def _build_categories_md(self, categories: dict, merge_suggestions: list, size_map: dict) -> str:
-        """Build the categories.md content from categorization results."""
+    def _build_categories_md(self, categories: dict[str, dict[str, list[str]]], size_map: dict) -> str:
+        """Build the categories.md content with 2-tier category/species structure."""
         today = date.today().isoformat()
         lines = [f"# Knowledge Library Categories\n", f"*Last updated: {today}*\n"]
 
@@ -1338,34 +1507,34 @@ class BeanBot(commands.Bot):
             key=lambda x: (x[0] == "Uncategorized", x[0])
         )
 
-        total = sum(len(files) for files in categories.values())
-        lines.append(f"**{total} files** across **{len(categories)} categories**\n")
+        total_files = sum(
+            len(files) for species_dict in categories.values() for files in species_dict.values()
+        )
+        total_species = sum(len(species_dict) for species_dict in categories.values())
+        lines.append(f"**{total_files} files** across **{len(categories)} categories**, **{total_species} species/topics**\n")
 
-        for cat_name, cat_files in sorted_cats:
-            sorted_files = sorted(cat_files)
-            file_lines = "\n".join(
-                f"  - {f} ({self._format_size(size_map.get(f, 0))})"
-                for f in sorted_files
+        for cat_name, species_dict in sorted_cats:
+            cat_file_count = sum(len(files) for files in species_dict.values())
+            section_lines = [f"## {cat_name} ({cat_file_count} files, {len(species_dict)} species)\n"]
+
+            # Sort species by file count descending, then alphabetically
+            sorted_species = sorted(
+                species_dict.items(),
+                key=lambda x: (-len(x[1]), x[0])
             )
-            section = f"## {cat_name} ({len(cat_files)} files)\n\n{file_lines}"
 
-            cat_merges = [
-                m for m in merge_suggestions
-                if any(f in cat_files for f in m.get("files", []))
-            ]
-            if cat_merges:
-                merge_lines = []
-                for m in cat_merges:
-                    target = m.get("target", m["files"][0])
-                    others = [f for f in m["files"] if f != target]
-                    if others:
-                        merge_lines.append(
-                            f"  - {' + '.join(m['files'])} -> `!consolidate {target.replace('.md', '')}`"
-                        )
-                if merge_lines:
-                    section += "\n\n  **Merge candidates:**\n" + "\n".join(merge_lines)
+            for species, files in sorted_species:
+                sorted_files = sorted(files)
+                count_label = f"{len(files)} file{'s' if len(files) != 1 else ''}"
+                section_lines.append(f"### {species} ({count_label})")
+                for f in sorted_files:
+                    section_lines.append(f"  - {f} ({self._format_size(size_map.get(f, 0))})")
+                if len(files) >= 2:
+                    hint = species.lower().replace(" ", "_")
+                    section_lines.append(f"  > `!consolidate {hint}`")
+                section_lines.append("")
 
-            lines.append(section)
+            lines.append("\n".join(section_lines))
 
         return "\n\n".join(lines) + "\n"
 
@@ -1390,41 +1559,44 @@ class BeanBot(commands.Bot):
                 categories = await categorize_files(file_entries, progress_callback=update_progress)
                 size_map = {e["filename"]: e["size_bytes"] for e in file_entries}
 
-                # Get merge suggestions (separate, smaller LLM call)
-                merge_suggestions = await suggest_merges(categories)
+                # Derive merge suggestions deterministically (no extra LLM call)
+                merge_suggestions = derive_merge_suggestions(categories)
 
                 # Save categories.md
-                categories_md = self._build_categories_md(categories, merge_suggestions, size_map)
+                categories_md = self._build_categories_md(categories, size_map)
                 categories_path = os.path.join("data", "categories.md")
                 with open(categories_path, "w") as f:
                     f.write(categories_md)
                 logger.info(f"Saved categorization to {categories_path}")
 
                 # Build a short Discord summary
-                total = sum(len(files) for files in categories.values())
+                total_files = sum(
+                    len(files) for species_dict in categories.values() for files in species_dict.values()
+                )
+                total_species = sum(len(species_dict) for species_dict in categories.values())
                 sorted_cats = sorted(
                     categories.items(),
-                    key=lambda x: (-len(x[1]), x[0])
+                    key=lambda x: (-sum(len(f) for f in x[1].values()), x[0])
                 )
                 cat_summary = "\n".join(
-                    f"  **{name}**: {len(files)} files"
-                    for name, files in sorted_cats
+                    f"  **{name}**: {sum(len(f) for f in species_dict.values())} files ({len(species_dict)} species)"
+                    for name, species_dict in sorted_cats
                 )
 
-                summary = f"Categorized **{total}** files into **{len(categories)}** categories:\n{cat_summary}\n"
+                summary = f"Categorized **{total_files}** files into **{len(categories)}** categories, **{total_species}** species:\n{cat_summary}\n"
 
                 if merge_suggestions:
+                    top_merges = merge_suggestions[:15]
                     merge_lines = []
-                    for m in merge_suggestions[:15]:
-                        target = m.get("target", m["files"][0])
+                    for m in top_merges:
                         merge_lines.append(
-                            f"  \u2022 {' + '.join(f'`{f}`' for f in m['files'])} \u2192 `!consolidate {target.replace('.md', '')}`"
+                            f"  {m['species']}: {len(m['files'])} files \u2192 `!consolidate {m['species'].lower().replace(' ', '_')}`"
                         )
-                    summary += f"\n**Merge candidates** ({len(merge_suggestions)} found):\n" + "\n".join(merge_lines)
+                    summary += f"\n**Top merge candidates** ({len(merge_suggestions)} species with 2+ files):\n" + "\n".join(merge_lines)
                     if len(merge_suggestions) > 15:
-                        summary += f"\n  *(+{len(merge_suggestions) - 15} more — ask me for the full list)*"
+                        summary += f"\n  *(+{len(merge_suggestions) - 15} more in categories.md)*"
 
-                summary += "\n\nAsk me about any category to see its files (e.g. *\"what's in the Trees category?\"*)."
+                summary += "\n\nSee `categories.md` for the full species breakdown."
                 await self._send_long_reply(ctx.message, summary)
 
             except Exception as e:
@@ -1633,6 +1805,7 @@ class BeanBot(commands.Bot):
                     "debrief_",
                     "recap_",
                     "consolidate_",
+                    "calendar_task_",
                 ]
                 total_deleted = 0
 
