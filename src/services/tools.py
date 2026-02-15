@@ -258,31 +258,43 @@ def amend_topic_knowledge(topic: str, content: str, source: str = "") -> str:
         logger.error(f"Failed to write to {path}: {e}")
         return f"Error updating topic file: {str(e)}"
 
-def add_task(task_description: str, due_date: str = "", assigned_to: str = "") -> str:
+def add_task(task_description: str, due_date: str = "", assigned_to: str = "", skip_duplicate_check: bool = False) -> str:
     """
     Adds a task to the task list.
     Args:
         task_description: The description of the task (e.g., "Fertilize the garlic").
         due_date: Optional due date in YYYY-MM-DD format.
         assigned_to: Optional name of the person this task is assigned to.
+        skip_duplicate_check: If True, skip duplicate detection and add directly.
     """
     filename = "tasks.md"
     path = os.path.join(DATA_DIR, filename)
+
+    if not skip_duplicate_check:
+        existing = get_open_tasks()
+        if existing:
+            similar = _find_similar_tasks(task_description, existing)
+            if similar:
+                bullet_list = "\n".join(f"- {t}" for t in similar)
+                return (
+                    f"Similar task(s) already exist:\n{bullet_list}\n"
+                    "Call tool_add_task again with skip_duplicate_check=True to add anyway, "
+                    "or use tool_complete_task to mark the old one done first."
+                )
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     assigned_str = f" [Assigned: {assigned_to.strip()}]" if assigned_to.strip() else ""
     due_str = f" [Due: {due_date}]" if due_date else ""
     formatted_entry = f"\n- [ ] {task_description}{assigned_str}{due_str} (Created: {timestamp})"
 
-    
     try:
         if not os.path.exists(path):
             with open(path, "w") as f:
                 f.write(f"# Task List\n")
-        
+
         with open(path, "a") as f:
             f.write(formatted_entry)
-            
+
         return f"Successfully added task: {task_description}"
     except Exception as e:
         logger.error(f"Failed to add task: {e}")
@@ -417,6 +429,44 @@ def find_related_files(topic: str) -> str:
     if not matches:
         return f"No files found related to '{topic}'."
     return "Related files: " + ", ".join(sorted(matches))
+
+
+_STOP_WORDS = frozenset({
+    "the", "a", "an", "in", "to", "for", "and", "of", "on", "at", "is", "it",
+    "by", "or", "be", "as", "do", "if", "up", "my", "so", "no", "we", "all",
+    "with", "this", "that", "from", "but", "not", "are", "was", "has", "had",
+})
+
+_TASK_METADATA_RE = re.compile(
+    r'\[Assigned:\s*[^\]]*\]|\[Due:\s*[^\]]*\]|\(Created:\s*[^\)]*\)|^- \[.\]\s*',
+)
+
+
+def _find_similar_tasks(description: str, existing_tasks: list[str], threshold: float = 0.5) -> list[str]:
+    """Find existing tasks similar to `description` using word-overlap (Jaccard similarity).
+
+    Strips metadata (assigned, due, created, checkbox prefix) before comparing.
+    Returns existing task lines where similarity >= threshold.
+    """
+    def _tokenize(text: str) -> set[str]:
+        cleaned = _TASK_METADATA_RE.sub("", text).strip()
+        return {w for w in cleaned.lower().split() if w not in _STOP_WORDS and len(w) > 1}
+
+    new_tokens = _tokenize(description)
+    if not new_tokens:
+        return []
+
+    matches = []
+    for task in existing_tasks:
+        task_tokens = _tokenize(task)
+        if not task_tokens:
+            continue
+        intersection = new_tokens & task_tokens
+        union = new_tokens | task_tokens
+        similarity = len(intersection) / len(union)
+        if similarity >= threshold:
+            matches.append(task)
+    return matches
 
 
 def get_open_tasks() -> list[str]:

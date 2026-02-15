@@ -63,9 +63,11 @@ def tool_amend_knowledge(topic: str, content: str, source: str = ""):
     return result
 
 @tool
-def tool_add_task(task_description: str, due_date: str = "", assigned_to: str = ""):
-    """Adds a task to the tracker. Args: task_description (text), due_date (YYYY-MM-DD, optional), assigned_to (name, optional)"""
-    return add_task(task_description, due_date, assigned_to)
+def tool_add_task(task_description: str, due_date: str = "", assigned_to: str = "", skip_duplicate_check: bool = False):
+    """Adds a task to the tracker. Checks for similar existing tasks first.
+    Args: task_description (text), due_date (YYYY-MM-DD, optional), assigned_to (name, optional),
+    skip_duplicate_check (set True to force-add even if similar tasks exist)"""
+    return add_task(task_description, due_date, assigned_to, skip_duplicate_check)
 
 @tool
 def tool_log_harvest(crop: str, amount: str, location: str, notes: str = ""):
@@ -194,7 +196,9 @@ STATIC_SYSTEM_PROMPT = (
     "TOOLS:\n"
     "- 'tool_read_file': Read content.\n"
     "- 'tool_amend_knowledge': Add or update knowledge about a topic. Creates the file if it doesn't exist, appends if it does. Pass the 'source' arg when you know where the info came from (URL, PDF filename, 'Discord message', 'image').\n"
-    "- 'tool_add_task': Schedule a reminder.\n"
+    "- 'tool_add_task': Schedule a reminder. Checks for similar existing tasks before adding. "
+    "If duplicates are found, it returns them instead of adding. Ask the user what they want to do: "
+    "add anyway, replace the old task, or skip. Use skip_duplicate_check=True only after user confirmation.\n"
     "- 'tool_log_harvest': Record yields.\n"
     "- 'tool_complete_task': Mark a task as done. Args: substring of task description.\n"
     "- 'tool_update_journal': Log general activities that are NOT tracked tasks.\n"
