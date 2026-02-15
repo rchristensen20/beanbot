@@ -170,6 +170,125 @@ def derive_merge_suggestions(categories: dict[str, dict[str, list[str]]]) -> lis
     return suggestions
 
 
+def _extract_json_array_or_object(text: str) -> dict | list:
+    """Extract JSON from LLM response, handling both arrays and objects."""
+    text = text.strip()
+    # Try to find JSON inside markdown code fences first
+    fence_match = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
+    if fence_match:
+        text = fence_match.group(1).strip()
+    # Find the first [ or {
+    arr_start = text.find("[")
+    obj_start = text.find("{")
+    if arr_start == -1 and obj_start == -1:
+        raise json.JSONDecodeError("No JSON found", text, 0)
+    # Use whichever comes first
+    if arr_start != -1 and (obj_start == -1 or arr_start < obj_start):
+        text = text[arr_start:]
+        brace_end = text.rfind("]")
+        if brace_end != -1:
+            text = text[:brace_end + 1]
+    else:
+        text = text[obj_start:]
+        brace_end = text.rfind("}")
+        if brace_end != -1:
+            text = text[:brace_end + 1]
+    return json.loads(text)
+
+
+async def analyze_duplicate_tasks(open_tasks: list[str]) -> list[dict]:
+    """Analyze open tasks for duplicates and near-duplicates using an LLM.
+
+    Args:
+        open_tasks: list of raw task lines (e.g. "- [ ] Water tomatoes [Due: ...]").
+
+    Returns:
+        list of dicts: {indices: [int], reason: str, suggested_merge: str, type: "duplicate"|"similar"}
+        Indices are 0-based positions in the input list.
+    """
+    if len(open_tasks) < 2:
+        return []
+
+    # Strip checkbox prefix for cleaner LLM input
+    numbered_lines = []
+    for i, task in enumerate(open_tasks):
+        clean = re.sub(r'^- \[[ x]\] ', '', task.strip())
+        numbered_lines.append(f"{i}: {clean}")
+    task_block = "\n".join(numbered_lines)
+
+    prompt = (
+        "You are analyzing a task list for duplicates and near-duplicates.\n\n"
+        "TASKS (index: description):\n"
+        f"{task_block}\n\n"
+        "RULES:\n"
+        "- Group tasks that are genuinely duplicate or overlapping (same work described differently)\n"
+        "- Do NOT group tasks just because they involve the same plant or area\n"
+        "- Each task can appear in at most ONE group\n"
+        "- Tasks assigned to different people doing the SAME work ARE duplicates\n"
+        "- 'duplicate' = essentially identical tasks; 'similar' = overlapping scope that could be merged\n"
+        "- For suggested_merge: write a single clean task line combining the best details from the group. "
+        "Preserve any [Assigned: ...] and [Due: ...] tags from the EARLIEST due date. "
+        "If tasks have different assignees, note both.\n\n"
+        "Respond with ONLY valid JSON (no markdown fences). Return a list:\n"
+        '[{"indices": [0, 3], "reason": "Both describe watering tomatoes", '
+        '"suggested_merge": "Water tomatoes in bed 2 [Due: 2025-06-15]", "type": "duplicate"}, ...]\n'
+        "If no duplicates or similar tasks exist, return []."
+    )
+
+    model = ChatGoogleGenerativeAI(
+        model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+        temperature=0,
+        max_output_tokens=4096,
+    )
+
+    logger.info(f"Analyzing {len(open_tasks)} tasks for duplicates...")
+    response = await model.ainvoke([HumanMessage(content=prompt)])
+    text = response.content if isinstance(response.content, str) else str(response.content)
+
+    try:
+        result = _extract_json_array_or_object(text)
+        if isinstance(result, dict):
+            result = result.get("groups", result.get("duplicates", []))
+        if not isinstance(result, list):
+            logger.warning(f"Unexpected result type from LLM: {type(result)}")
+            return []
+    except (json.JSONDecodeError, Exception) as e:
+        logger.warning(f"Failed to parse duplicate analysis: {e}")
+        return []
+
+    # Validate: indices in-bounds, no task in multiple groups
+    max_idx = len(open_tasks) - 1
+    seen_indices: set[int] = set()
+    validated = []
+    for group in result:
+        if not isinstance(group, dict):
+            continue
+        indices = group.get("indices", [])
+        if not isinstance(indices, list) or len(indices) < 2:
+            continue
+        # Check bounds and uniqueness
+        valid = True
+        for idx in indices:
+            if not isinstance(idx, int) or idx < 0 or idx > max_idx:
+                valid = False
+                break
+            if idx in seen_indices:
+                valid = False
+                break
+        if not valid:
+            continue
+        seen_indices.update(indices)
+        validated.append({
+            "indices": indices,
+            "reason": group.get("reason", ""),
+            "suggested_merge": group.get("suggested_merge", ""),
+            "type": group.get("type", "similar"),
+        })
+
+    logger.info(f"Found {len(validated)} duplicate/similar task groups")
+    return validated
+
+
 async def suggest_merges(categories: dict[str, list[str]]) -> list[dict]:
     """Direct LLM call to identify merge candidates within categories.
 

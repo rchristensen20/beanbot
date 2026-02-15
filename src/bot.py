@@ -18,8 +18,8 @@ BOT_TZ = ZoneInfo(os.getenv("BOT_TIMEZONE", "America/Denver"))
 from src.graph import init_graph
 import src.graph as graph_module
 # Import basic file reader for the daily report
-from src.services.tools import read_knowledge_file, get_open_tasks, find_related_files, search_file_contents, build_library_index, get_library_files, is_onboarding_complete, register_member, get_member_name_by_discord_id, list_members, get_tasks_for_user, get_clearable_knowledge_files, clear_all_knowledge_files, clear_entire_garden, delete_knowledge_file, complete_task, filter_tasks_due_today_or_overdue, _sanitize_topic, SYSTEM_FILES, DATA_DIR
-from src.services.categorization import categorize_files, derive_merge_suggestions
+from src.services.tools import read_knowledge_file, get_open_tasks, find_related_files, search_file_contents, build_library_index, get_library_files, is_onboarding_complete, register_member, get_member_name_by_discord_id, list_members, get_tasks_for_user, get_clearable_knowledge_files, clear_all_knowledge_files, clear_entire_garden, delete_knowledge_file, complete_task, filter_tasks_due_today_or_overdue, backup_file, overwrite_knowledge_file, _sanitize_topic, SYSTEM_FILES, DATA_DIR
+from src.services.categorization import categorize_files, derive_merge_suggestions, analyze_duplicate_tasks
 from src.services.weather import fetch_current_weather, fetch_forecast
 
 # Configure logging
@@ -620,6 +620,198 @@ class CalendarTaskView(discord.ui.View):
                 pass
 
 
+class TaskConsolidateView(discord.ui.View):
+    """Non-persistent, author-gated view for stepping through duplicate task groups."""
+
+    def __init__(self, bot: "BeanBot", groups: list[dict], all_tasks: list[str], completed_tasks: list[str], author_id: int):
+        super().__init__(timeout=300)  # 5-minute timeout
+        self.bot = bot
+        self.groups = groups
+        self.all_tasks = all_tasks  # open tasks
+        self.completed_tasks = completed_tasks
+        self.author_id = author_id
+        self.current_group = 0
+        self.decisions: dict[int, str] = {}  # group_index -> "merge"|"keep"|"remove_dups"
+        self.message: discord.Message | None = None
+
+        merge_btn = discord.ui.Button(label="Merge", style=discord.ButtonStyle.success)
+        keep_btn = discord.ui.Button(label="Keep All", style=discord.ButtonStyle.secondary)
+        remove_btn = discord.ui.Button(label="Remove Duplicates", style=discord.ButtonStyle.danger)
+
+        merge_btn.callback = self._merge
+        keep_btn.callback = self._keep
+        remove_btn.callback = self._remove_dups
+
+        self.add_item(merge_btn)
+        self.add_item(keep_btn)
+        self.add_item(remove_btn)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "Only the person who ran this command can use these buttons.", ephemeral=True
+            )
+            return False
+        return True
+
+    def _build_embed(self) -> discord.Embed:
+        """Build an embed for the current group."""
+        group = self.groups[self.current_group]
+        group_type = group.get("type", "similar").title()
+        embed = discord.Embed(
+            title=f"Group {self.current_group + 1}/{len(self.groups)} — {group_type}",
+            color=discord.Color.orange() if group["type"] == "similar" else discord.Color.red(),
+        )
+        # Show the tasks in this group
+        task_lines = []
+        for idx in group["indices"]:
+            task_lines.append(f"`{idx+1}.` {_extract_task_description(self.all_tasks[idx])}")
+        embed.add_field(name="Tasks", value="\n".join(task_lines), inline=False)
+        embed.add_field(name="Why grouped", value=group.get("reason", "N/A"), inline=False)
+        if group.get("suggested_merge"):
+            clean_merge = re.sub(r'^- \[[ x]\] ', '', group["suggested_merge"])
+            embed.add_field(name="Suggested merge", value=clean_merge, inline=False)
+        embed.set_footer(text="Merge = combine into one task | Keep All = no change | Remove Duplicates = keep first, delete rest")
+        return embed
+
+    async def _advance(self, interaction: discord.Interaction, decision: str):
+        """Record decision and advance to next group or apply all."""
+        self.decisions[self.current_group] = decision
+        self.current_group += 1
+
+        if self.current_group < len(self.groups):
+            embed = self._build_embed()
+            await interaction.response.edit_message(embed=embed, view=self)
+        else:
+            await interaction.response.edit_message(
+                content="Applying changes...", embed=None, view=None
+            )
+            summary = await self._apply_decisions()
+            await interaction.message.edit(content=summary)
+
+    async def _merge(self, interaction: discord.Interaction):
+        await self._advance(interaction, "merge")
+
+    async def _keep(self, interaction: discord.Interaction):
+        await self._advance(interaction, "keep")
+
+    async def _remove_dups(self, interaction: discord.Interaction):
+        await self._advance(interaction, "remove_dups")
+
+    async def _apply_decisions(self) -> str:
+        """Apply all decisions: backup, rewrite tasks.md, return summary."""
+        backup_file("tasks.md")
+
+        indices_to_remove: set[int] = set()
+        new_merged_lines: list[str] = []
+        merge_count = 0
+        remove_count = 0
+
+        for group_idx, decision in self.decisions.items():
+            group = self.groups[group_idx]
+            group_indices = group["indices"]
+
+            if decision == "keep":
+                continue
+
+            elif decision == "merge":
+                # Remove all tasks in the group
+                indices_to_remove.update(group_indices)
+                # Parse the suggested merge into task line(s)
+                suggested = group.get("suggested_merge", "").strip()
+                if not suggested:
+                    # Fallback: keep the first task
+                    indices_to_remove.discard(group_indices[0])
+                    continue
+                # Collect assignees from original tasks
+                assignees: set[str] = set()
+                earliest_due = None
+                for idx in group_indices:
+                    task = self.all_tasks[idx]
+                    assigned_match = re.search(r'\[Assigned:\s*([^\]]+)\]', task)
+                    if assigned_match:
+                        assignees.add(assigned_match.group(1).strip())
+                    due_match = re.search(r'\[Due:\s*(\d{4}-\d{2}-\d{2})\]', task)
+                    if due_match:
+                        d = due_match.group(1)
+                        if earliest_due is None or d < earliest_due:
+                            earliest_due = d
+
+                # Strip any existing metadata from suggested merge
+                clean_suggested = re.sub(r'\s*\[Assigned:\s*[^\]]*\]', '', suggested)
+                clean_suggested = re.sub(r'\s*\[Due:\s*[^\]]*\]', '', clean_suggested)
+                clean_suggested = re.sub(r'\s*\(Created:\s*[^)]*\)', '', clean_suggested)
+                clean_suggested = re.sub(r'^- \[[ x]\] ', '', clean_suggested).strip()
+
+                due_str = f" [Due: {earliest_due}]" if earliest_due else ""
+                now_str = datetime.now(BOT_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+                if len(assignees) > 1:
+                    # Multiple assignees: create one line per assignee
+                    for assignee in sorted(assignees):
+                        new_merged_lines.append(
+                            f"- [ ] {clean_suggested} [Assigned: {assignee}]{due_str} (Created: {now_str})"
+                        )
+                elif len(assignees) == 1:
+                    assignee = next(iter(assignees))
+                    new_merged_lines.append(
+                        f"- [ ] {clean_suggested} [Assigned: {assignee}]{due_str} (Created: {now_str})"
+                    )
+                else:
+                    new_merged_lines.append(
+                        f"- [ ] {clean_suggested}{due_str} (Created: {now_str})"
+                    )
+                merge_count += 1
+
+            elif decision == "remove_dups":
+                # Keep first (lowest index), remove rest
+                sorted_indices = sorted(group_indices)
+                indices_to_remove.update(sorted_indices[1:])
+                remove_count += len(sorted_indices) - 1
+
+        # Reconstruct tasks.md
+        surviving_open = []
+        for i, task in enumerate(self.all_tasks):
+            if i not in indices_to_remove:
+                surviving_open.append(task)
+
+        lines = ["# Task List\n"]
+        for task in surviving_open:
+            lines.append(task)
+        for task in new_merged_lines:
+            lines.append(task)
+        for task in self.completed_tasks:
+            lines.append(task)
+
+        content = "\n".join(lines) + "\n"
+        overwrite_knowledge_file("tasks.md", content)
+
+        parts = []
+        if merge_count:
+            parts.append(f"{merge_count} group(s) merged")
+        if remove_count:
+            parts.append(f"{remove_count} duplicate(s) removed")
+        kept = len(self.decisions) - merge_count - (1 if remove_count else 0)
+        # Count groups where decision was "keep"
+        kept_count = sum(1 for d in self.decisions.values() if d == "keep")
+        if kept_count:
+            parts.append(f"{kept_count} group(s) kept as-is")
+
+        summary = f"**Task consolidation complete.** " + ", ".join(parts) + ". Backup saved to `data/backups/`."
+        return summary
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                await self.message.edit(
+                    content="Task consolidation timed out (5 min). No changes were made.",
+                    embed=None,
+                    view=None,
+                )
+            except Exception:
+                pass
+
+
 class BeanBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -719,6 +911,7 @@ class BeanBot(commands.Bot):
             "`!recap [days]` — Summarize the last N days of garden activity (default 7)\n"
             "`!consolidate` — Categorize all knowledge files and find merge candidates\n"
             "`!consolidate <topic>` — Merge all files about a topic into one clean file\n"
+            "`!consolidate tasks` — Deduplicate and clean up the task list interactively\n"
             "`!register <name>` — Register yourself as a garden member\n"
             "`!register <name> @user` — Register someone else as a garden member\n"
             "`!members` — List all registered garden members\n"
@@ -1439,7 +1632,9 @@ class BeanBot(commands.Bot):
             await ctx.send("This command can only be used in the questions, reminders, or journal channel.")
             return
 
-        if topic:
+        if topic and topic.lower() == "tasks":
+            await self._consolidate_tasks(ctx)
+        elif topic:
             await self._consolidate_single(ctx, topic)
         else:
             await self._consolidate_full(ctx)
@@ -1501,6 +1696,53 @@ class BeanBot(commands.Bot):
                 prompt, "questions", thread_id=f"consolidate_{topic}_{today}"
             )
             await self._send_long_reply(ctx.message, response)
+
+    async def _consolidate_tasks(self, ctx):
+        """Analyze open tasks for duplicates and present interactive consolidation UI."""
+        open_tasks = get_open_tasks()
+        if len(open_tasks) < 2:
+            await ctx.send("Not enough open tasks to consolidate (need at least 2).")
+            return
+
+        # Read completed tasks from tasks.md
+        tasks_path = os.path.join(DATA_DIR, "tasks.md")
+        completed_tasks = []
+        try:
+            with open(tasks_path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if "- [x]" in line:
+                        completed_tasks.append(line)
+        except Exception:
+            pass
+
+        progress_msg = await ctx.send(f"Analyzing {len(open_tasks)} open tasks for duplicates...")
+
+        try:
+            groups = await analyze_duplicate_tasks(open_tasks)
+        except Exception as e:
+            logger.error(f"Task duplicate analysis failed: {e}", exc_info=True)
+            await progress_msg.edit(content=f"Analysis failed: {e}")
+            return
+
+        if not groups:
+            await progress_msg.edit(content="No duplicate or similar tasks found — all clear!")
+            return
+
+        view = TaskConsolidateView(
+            bot=self,
+            groups=groups,
+            all_tasks=open_tasks,
+            completed_tasks=completed_tasks,
+            author_id=ctx.author.id,
+        )
+        embed = view._build_embed()
+        await progress_msg.edit(
+            content=f"Found **{len(groups)}** group(s) of duplicate/similar tasks. Review each one:",
+            embed=embed,
+            view=view,
+        )
+        view.message = progress_msg
 
     def _format_size(self, size_bytes: int) -> str:
         """Format byte size as human-readable string."""
