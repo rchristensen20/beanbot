@@ -99,6 +99,11 @@ def _extract_task_description(task_line: str) -> str:
     return (text.strip() + due_suffix).strip()
 
 
+def _extract_task_description_numbered(num: int, desc: str) -> str:
+    """Format a task description as a numbered line."""
+    return f"{num}. {desc}"
+
+
 CHANNEL_CONTEXT = {
     "journal": "[CONTEXT: User is posting in the JOURNAL channel. Prioritize logging updates and amending knowledge.]\n\n",
     "questions": "[CONTEXT: User is posting in the QUESTIONS channel. You MUST use tools to retrieve info before answering.]\n\n",
@@ -866,6 +871,10 @@ class BeanBot(commands.Bot):
         async def version_cmd(ctx):
             await ctx.send(f"Beanbot v{BOT_VERSION}")
 
+        @self.command(name="tasks")
+        async def tasks_cmd(ctx):
+            await self.show_tasks(ctx)
+
         @self.command(name="clear")
         async def clear_cmd(ctx, *, topic: str = ""):
             await self.clear(ctx, topic.strip())
@@ -902,6 +911,37 @@ class BeanBot(commands.Bot):
         lines = [f"- **{name.title()}**: <@{did}>" for name, did in members.items()]
         await ctx.send("**Registered Members:**\n" + "\n".join(lines))
 
+    async def show_tasks(self, ctx):
+        """Show all open tasks grouped by assignee."""
+        open_tasks = get_open_tasks()
+        if not open_tasks:
+            await ctx.send("No open tasks.")
+            return
+
+        assigned_re = re.compile(r'\[Assigned:\s*([^\]]+)\]', re.IGNORECASE)
+        groups: dict[str, list[str]] = {}  # assignee -> task descriptions
+
+        for task in open_tasks:
+            match = assigned_re.search(task)
+            key = match.group(1).strip().title() if match else "Unassigned"
+            groups.setdefault(key, []).append(_extract_task_description(task))
+
+        # Build output: unassigned first, then alphabetical by name
+        sections = []
+        if "Unassigned" in groups:
+            lines = [f"  {_extract_task_description_numbered(i, t)}" for i, t in enumerate(groups["Unassigned"], 1)]
+            sections.append(f"**Unassigned** ({len(groups['Unassigned'])}):\n" + "\n".join(lines))
+
+        for name in sorted(k for k in groups if k != "Unassigned"):
+            tasks = groups[name]
+            lines = [f"  {_extract_task_description_numbered(i, t)}" for i, t in enumerate(tasks, 1)]
+            sections.append(f"**{name}** ({len(tasks)}):\n" + "\n".join(lines))
+
+        total = len(open_tasks)
+        header = f"**Open Tasks ({total})**\n"
+        body = header + "\n\n".join(sections)
+        await self._send_long_reply(ctx.message, body)
+
     async def show_commands(self, ctx):
         """Show all available commands with brief usage."""
         text = (
@@ -912,6 +952,7 @@ class BeanBot(commands.Bot):
             "`!consolidate` — Categorize all knowledge files and find merge candidates\n"
             "`!consolidate <topic>` — Merge all files about a topic into one clean file\n"
             "`!consolidate tasks` — Deduplicate and clean up the task list interactively\n"
+            "`!tasks` — Show all open tasks grouped by assignee\n"
             "`!register <name>` — Register yourself as a garden member\n"
             "`!register <name> @user` — Register someone else as a garden member\n"
             "`!members` — List all registered garden members\n"

@@ -29,7 +29,9 @@ A personal gardening assistant Discord bot powered by an agentic AI workflow.
 
 - **Evening debrief** — evening cron job. Posts a summary of open tasks in the journal channel with a **"Log Today's Debrief"** button. Clicking the button opens a Discord modal with 5 optional fields (Activities, Harvests, Pest/Disease, Observations, Task Updates). On submit, the structured data is sent through the LLM agent. Supports manual triggering via `!debrief`. Buttons persist across bot restarts.
 
-- **Knowledge ingestion pipeline** — Send a URL, upload a file (including PDFs), or paste raw text. The bot extracts content, chunks it, and writes structured notes to per-topic markdown files.
+- **Knowledge ingestion pipeline** — Send a URL, upload a file (including PDFs), or paste raw text. The bot extracts content, chunks it, and writes structured notes to per-topic markdown files. Source citations are tracked per topic, and contradictions with existing knowledge are flagged with conflict notes.
+
+- **Link crawling** — When ingesting a URL, the bot discovers same-domain links on the page and offers to crawl and ingest them too. After ingestion, an optional step offers to update the planting calendar and create tasks from the new content.
 
 - **Weather integration** — OpenWeatherMap API for current conditions and 48-hour forecast.
 
@@ -40,6 +42,12 @@ A personal gardening assistant Discord bot powered by an agentic AI workflow.
 - **Image understanding** — Upload garden photos for plant/pest identification or layout mapping via Gemini's vision capabilities.
 
 - **Onboarding flow** — First-time setup via DM (`!setup`). The bot walks you through location/zone detection, garden layout, knowledge building guidance, and channel orientation. Creates `almanac.md` and `farm_layout.md` automatically.
+
+- **Knowledge consolidation** — `!consolidate <topic>` merges related files into one clean document. `!consolidate` (no args) runs LLM-powered semantic categorization across the entire library. `!consolidate tasks` analyzes open tasks for duplicates with an interactive merge UI.
+
+- **Clear & reset commands** — `!clear <topic>` deletes a single file (2-step confirm), `!clear knowledge` wipes all non-system files (3-step), `!clear garden` factory-resets everything (3-step).
+
+- **Database maintenance** — Nightly pruning of conversation checkpoints. Ephemeral threads (daily reports, debriefs) are cleaned up after 7 days; persistent threads are trimmed to the last 20 checkpoints.
 
 - **Docker deployment** — single `docker-compose up` with volume persistence.
 
@@ -104,7 +112,7 @@ docker-compose up --build -d
 **Local:**
 ```bash
 uv sync
-python -m src.bot
+uv run python -m src.bot
 ```
 
 ## Environment Variables
@@ -127,23 +135,28 @@ python -m src.bot
 
 | Module | Role |
 |---|---|
-| `src/bot.py` | Discord bot — routing, commands (`!briefing`, `!debrief`, `!consolidate`, `!recap`, `!setup`, `!register`, `!members`, `!commands`, `!version`), scheduled loops (daily report, debrief, weather alerts, weekly recap), message parsing, debrief UI (modal + persistent view), onboarding flow, user identity injection |
+| `src/bot.py` | Discord bot — routing, commands (`!briefing`, `!debrief`, `!consolidate`, `!consolidate tasks`, `!tasks`, `!recap`, `!setup`, `!register`, `!members`, `!clear`, `!commands`, `!version`), scheduled loops (daily report, debrief, weather alerts, weekly recap, DB prune), message parsing, debrief UI (modal + persistent view), ingestion pipeline (URL fetch, PDF extract, link crawling, calendar/task offers), onboarding flow, user identity injection |
 | `src/graph.py` | LangGraph state machine — agent loop with tools, system prompt, SQLite checkpointer |
-| `src/services/tools.py` | Core logic — file operations, task management, harvest logging, calendar generation, search, member registry |
+| `src/services/tools.py` | Core logic — file operations, task management, harvest logging, calendar generation, search, member registry, backup/restore |
 | `src/services/weather.py` | Standalone async functions for current weather and 48-hour forecast via OpenWeatherMap |
-| `src/services/categorization.py` | Direct LLM calls for semantic file categorization and merge suggestions (used by `!consolidate`) |
-| `data/` | Knowledge library — `tasks.md`, `harvests.md`, `planting_calendar.md`, `garden_log.md`, `categories.md`, `members.json`, and topic files |
+| `src/services/categorization.py` | Direct LLM calls for semantic file categorization, merge suggestions, and task duplicate analysis |
+| `data/` | Knowledge library — `tasks.md`, `harvests.md`, `planting_calendar.md`, `garden_log.md`, `almanac.md`, `farm_layout.md`, `categories.md`, `members.json`, `conversations.db`, and per-topic markdown files |
 
 ## Commands
 
 - `!briefing` — Trigger the morning briefing manually (reminders or journal channel).
 - `!debrief` — Trigger the evening debrief prompt (journal channel). Shows your assigned tasks + unassigned.
+- `!tasks` — Show all open tasks grouped by assignee.
 - `!consolidate` — Categorize all knowledge files by type, identify merge candidates, save to `categories.md`.
 - `!consolidate <topic>` — Merge all files related to a topic into a single clean file (with backups).
+- `!consolidate tasks` — Analyze open tasks for duplicates. Interactive UI lets you merge, keep, or remove duplicates.
 - `!recap [days]` — Summarize the last N days of garden activity (default 7, max 90).
 - `!setup` — Start the onboarding flow (walks you through location, garden layout, and orientation via DM).
 - `!register <name>` — Register yourself as a named garden member. Use `!register <name> @user` to register someone else.
 - `!members` — List all registered garden members.
+- `!clear <topic>` — Delete a single knowledge file (2-step confirmation).
+- `!clear knowledge` — Delete all non-system knowledge files (3-step confirmation).
+- `!clear garden` — Factory reset: delete everything in `data/` (3-step confirmation).
 - `!commands` — Show all commands with brief usage.
 - `!version` — Show the current Beanbot version.
 
@@ -173,11 +186,11 @@ python -m src.bot
 
 ## Running Locally
 
-Requires Python 3.12+.
+Requires Python 3.13+.
 
 ```bash
 uv sync
-python -m src.bot
+uv run python -m src.bot
 ```
 
 ## Releasing
@@ -185,13 +198,11 @@ python -m src.bot
 This project uses [bump-my-version](https://github.com/callowayproject/bump-my-version) for version management.
 
 ```bash
-# Install dev dependencies
-uv sync --extra dev
-
 # Bump version (creates commit + tag)
-bump-my-version bump patch   # 1.0.0 → 1.0.1
-bump-my-version bump minor   # 1.0.0 → 1.1.0
-bump-my-version bump major   # 1.0.0 → 2.0.0
+# IMPORTANT: requires a clean git working tree — commit uv.lock first
+uv run bump-my-version bump patch   # 1.0.0 → 1.0.1
+uv run bump-my-version bump minor   # 1.0.0 → 1.1.0
+uv run bump-my-version bump major   # 1.0.0 → 2.0.0
 ```
 
 This updates `pyproject.toml` and `CHANGELOG.md`, creates a git commit, and tags it.
