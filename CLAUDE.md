@@ -46,6 +46,7 @@ data/                           → Markdown knowledge library (auto-managed by 
 - `!consolidate tasks` — LLM-powered task deduplication: analyzes open tasks for duplicates/near-duplicates, presents groups interactively with Merge/Keep All/Remove Duplicates buttons, then rewrites `tasks.md` based on user decisions. Backs up before modifying. Works in questions, reminders, or journal channel.
 - `!consolidate` (no args) — LLM-based semantic categorization: sends all filenames to Gemini in batches, groups them by plant type (Trees, Herbs, Vegetables, etc.), identifies merge candidates, saves results to `categories.md`, and posts a summary to Discord. Falls back to prefix-based grouping on LLM failure.
 - `!tasks` — Show all open tasks grouped by assignee with clean formatting (due dates, no metadata). Works in any monitored channel.
+- `!calendar` — Show the current planting calendar as-is. Reads and displays `planting_calendar.md` directly. Works in any channel.
 - `!recap [days]` — Generate a recap of the last N days (default 7, max 90) of garden activity. Summarizes journal entries, harvests, and task progress. Works in reminders, journal, or questions channel.
 - `!setup` — Start onboarding flow. Redirects to DMs if called from a channel. Walks user through location/zone, garden layout, knowledge building, and channel orientation. Skips if already complete.
 - `!register <name>` — Register the calling user as a named garden member. Creates/updates `data/members.json`.

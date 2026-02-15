@@ -880,6 +880,10 @@ class BeanBot(commands.Bot):
         async def tasks_cmd(ctx):
             await self.show_tasks(ctx)
 
+        @self.command(name="calendar")
+        async def calendar_cmd(ctx):
+            await self.show_calendar(ctx)
+
         @self.command(name="clear")
         async def clear_cmd(ctx, *, topic: str = ""):
             await self.clear(ctx, topic.strip())
@@ -947,6 +951,14 @@ class BeanBot(commands.Bot):
         body = header + "\n\n".join(sections)
         await self._send_long_reply(ctx.message, body)
 
+    async def show_calendar(self, ctx):
+        """Display the current planting calendar."""
+        content = read_knowledge_file("planting_calendar.md")
+        if content.startswith("Error:"):
+            await ctx.send("No planting calendar yet. Ingest some planting guides first, then click **Update Calendar & Create Tasks**.")
+            return
+        await self._send_long_reply(ctx.message, content)
+
     async def show_commands(self, ctx):
         """Show all available commands with brief usage."""
         text = (
@@ -958,6 +970,7 @@ class BeanBot(commands.Bot):
             "`!consolidate <topic>` — Merge all files about a topic into one clean file\n"
             "`!consolidate tasks` — Deduplicate and clean up the task list interactively\n"
             "`!tasks` — Show all open tasks grouped by assignee\n"
+            "`!calendar` — Show the current planting calendar\n"
             "`!register <name>` — Register yourself as a garden member\n"
             "`!register <name> @user` — Register someone else as a garden member\n"
             "`!members` — List all registered garden members\n"
