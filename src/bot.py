@@ -575,8 +575,13 @@ class CalendarTaskView(discord.ui.View):
             content="Updating planting calendar and creating tasks...", view=None
         )
 
-        selected_indices = [int(v) for v in self._select.values]
-        selected_files = [self.ingested_files[i] for i in selected_indices]
+        # .values is only populated after user interacts with the Select;
+        # if they just click the button, default to all files (visually pre-selected).
+        if self._select.values:
+            selected_indices = [int(v) for v in self._select.values]
+            selected_files = [self.ingested_files[i] for i in selected_indices]
+        else:
+            selected_files = self.ingested_files[:25]
         files_str = ", ".join(selected_files)
         today = date.today().isoformat()
         prompt = (
