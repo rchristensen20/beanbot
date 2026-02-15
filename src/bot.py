@@ -1383,7 +1383,10 @@ class BeanBot(commands.Bot):
             if "NO_ACTION" not in response:
                 if members:
                     response = self._inject_mentions(response)
-                await channel.send(f"**Morning Briefing:**\n{response}")
+                full_msg = f"**Morning Briefing:**\n{response}"
+                chunks = self._chunk_text(full_msg, max_size=DISCORD_MESSAGE_LIMIT)
+                for chunk in chunks:
+                    await channel.send(chunk)
             elif manual:
                 await channel.send("Nothing urgent today — all clear!")
         except asyncio.TimeoutError:
