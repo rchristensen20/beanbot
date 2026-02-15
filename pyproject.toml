@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "beanbot"
-version = "1.8.1"
+version = "1.8.2"
 description = "A personal gardening assistant Discord bot using LangGraph and Google Gemini."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -32,7 +32,7 @@ dev = [
 packages = ["src"]
 
 [tool.bumpversion]
-current_version = "1.8.1"
+current_version = "1.8.2"
 commit = true
 tag = true
 tag_name = "v{new_version}"
