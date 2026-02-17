@@ -99,10 +99,10 @@ uv run bump-my-version bump patch|minor|major
 When the user asks to commit, tag, and push (or any combination), follow this exact sequence every time. Run steps 1-4 as a single chained command:
 
 ```bash
-git add <files> && git commit -m "<message>" && uv sync && git add uv.lock && git diff --cached --quiet || git commit -m "Sync uv.lock" && uv run bump-my-version bump patch && git push && git push --tags
+git add <files> && git commit -m "<message>" && uv sync --extra dev && git add uv.lock && git diff --cached --quiet || git commit -m "Sync uv.lock" && uv run bump-my-version bump patch && git push && git push --tags
 ```
 
-Why `uv sync` before bumping: `uv run` syncs the environment before running any command. If `uv.lock` is stale (e.g. from a previous version bump changing `pyproject.toml`), `uv run` will modify it, and `bump-my-version` will fail because the working tree is dirty. Running `uv sync` explicitly and committing the result ensures a clean tree.
+Why `uv sync --extra dev`: `bump-my-version` is a dev dependency. Plain `uv sync` uninstalls dev extras, which removes bump-my-version. The `--extra dev` flag keeps it installed. This also syncs `uv.lock` with any pyproject.toml changes (e.g. from a previous version bump), ensuring a clean working tree before bump-my-version runs.
 
 ## Adding New Tools
 
