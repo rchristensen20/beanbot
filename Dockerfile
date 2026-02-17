@@ -9,15 +9,22 @@ ENV UV_COMPILE_BYTECODE=1
 # Install uv
 RUN pip install --no-cache-dir uv
 
-# Copy dependency definitions and metadata needed for the build
-COPY pyproject.toml .
-COPY uv.lock .
-COPY README.md .
+# Copy dependency definitions first (cached unless deps change)
+COPY pyproject.toml uv.lock README.md ./
+
+# Install dependencies only (not the project itself)
+# --frozen: use exact versions from lock file
+# Cache mount: even if pyproject.toml changes (version bump), packages
+# are linked from cache instead of re-downloaded
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-install-project
+
+# Now copy source code (changes frequently, but deps are already installed)
 COPY src src
 
-# Install dependencies (including the project itself)
-# --frozen: Use exact versions from the lock file
-RUN uv sync --frozen
+# Install the project itself (fast — just links the local package)
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen
 
 # Create data directory (populated at runtime via volume mount or bot usage)
 RUN mkdir -p data
