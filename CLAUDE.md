@@ -96,16 +96,13 @@ uv run bump-my-version bump patch|minor|major
 
 ## Commit, Tag & Push Procedure
 
-When the user asks to commit, tag, and push (or any combination), follow this exact sequence every time:
+When the user asks to commit, tag, and push (or any combination), follow this exact sequence every time. Run steps 1-4 as a single chained command:
 
-1. `git add <files>` — stage your changes
-2. `git commit` — commit with a descriptive message
-3. `git add uv.lock` — uv.lock almost always has changes after installs/syncs. Stage it.
-4. `git diff --cached --quiet uv.lock` — if uv.lock had changes, commit it: `git commit -m "Sync uv.lock"`
-5. `uv run bump-my-version bump patch` (or minor/major as requested) — this requires a **clean working tree**. If it fails, check `git status`, commit any remaining dirty files, and retry.
-6. `git push && git push --tags` — push everything including the new version tag.
+```bash
+git add <files> && git commit -m "<message>" && uv sync && git add uv.lock && git diff --cached --quiet || git commit -m "Sync uv.lock" && uv run bump-my-version bump patch && git push && git push --tags
+```
 
-Do NOT skip step 3. Do NOT try to run bump-my-version before ensuring a clean working tree. Do NOT debug this interactively — just follow the steps.
+Why `uv sync` before bumping: `uv run` syncs the environment before running any command. If `uv.lock` is stale (e.g. from a previous version bump changing `pyproject.toml`), `uv run` will modify it, and `bump-my-version` will fail because the working tree is dirty. Running `uv sync` explicitly and committing the result ensures a clean tree.
 
 ## Adding New Tools
 
