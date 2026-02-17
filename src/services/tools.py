@@ -537,6 +537,29 @@ def get_current_date() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
+def web_search(query: str, max_results: int = 5) -> str:
+    """Search the web via DuckDuckGo and return formatted results."""
+    max_results = max(1, min(10, max_results))
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        return "Error: ddgs package is not installed."
+    try:
+        results = DDGS().text(query, max_results=max_results)
+    except Exception as e:
+        logger.error(f"Web search failed for query '{query}': {e}")
+        return f"Web search failed: {str(e)}"
+    if not results:
+        return f"No web results found for '{query}'."
+    parts = [f"Web search results for '{query}':\n"]
+    for i, r in enumerate(results, 1):
+        title = r.get("title", "No title")
+        href = r.get("href", "")
+        body = r.get("body", "No description")
+        parts.append(f"{i}. **{title}**\n   URL: {href}\n   {body}\n")
+    return "\n".join(parts)
+
+
 def search_file_contents(query: str) -> list[str]:
     """
     Searches inside all .md files for case-insensitive mentions of a topic.
@@ -725,6 +748,47 @@ def clear_entire_garden() -> dict:
             errors.append(f"{entry}: {e}")
 
     return {"deleted_files": deleted_files, "deleted_dirs": deleted_dirs, "errors": errors}
+
+
+def remove_tasks(snippet: str) -> str:
+    """Remove (permanently delete) all open tasks whose description matches a substring.
+
+    Unlike complete_task (which checks the box), this deletes the lines entirely.
+    Only matches open tasks (``- [ ]``). Completed tasks are never touched.
+
+    Args:
+        snippet: Case-insensitive substring to match against task lines.
+    """
+    filename = "tasks.md"
+    path = os.path.join(DATA_DIR, filename)
+
+    if not os.path.exists(path):
+        return "Task list file does not exist."
+
+    try:
+        with open(path, "r") as f:
+            lines = f.readlines()
+
+        kept: list[str] = []
+        removed: list[str] = []
+        snippet_lower = snippet.lower()
+
+        for line in lines:
+            if "- [ ]" in line and snippet_lower in line.lower():
+                removed.append(line.strip())
+            else:
+                kept.append(line)
+
+        if not removed:
+            return f"No open tasks found matching '{snippet}'."
+
+        with open(path, "w") as f:
+            f.writelines(kept)
+
+        return f"Removed {len(removed)} task(s) matching '{snippet}':\n" + "\n".join(f"- {t}" for t in removed)
+    except Exception as e:
+        logger.error(f"Failed to remove tasks: {e}")
+        return f"Error removing tasks: {str(e)}"
 
 
 def complete_task(task_snippet: str) -> str:

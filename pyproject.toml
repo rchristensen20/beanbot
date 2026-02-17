@@ -19,7 +19,8 @@ dependencies = [
     "beautifulsoup4>=4.12.0",
     "langgraph-checkpoint-sqlite>=2.0.0",
     "aiosqlite",
-    "pymupdf>=1.24.0"
+    "pymupdf>=1.24.0",
+    "ddgs>=7.0.0"
 ]
 
 [project.optional-dependencies]

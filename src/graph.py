@@ -29,6 +29,8 @@ from src.services.tools import (
     delete_knowledge_file,
     list_members,
     get_tasks_for_user,
+    web_search,
+    remove_tasks,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,7 +58,7 @@ def tool_update_journal(entry: str):
 
 @tool
 def tool_amend_knowledge(topic: str, content: str, source: str = ""):
-    """Updates a specific topic file with new notes/facts. Pass 'source' when you know where the info came from (URL, PDF filename, 'Discord message', 'image'). Args: topic (e.g. 'garlic'), content (text), source (optional provenance string)"""
+    """Appends knowledge to a topic file (creates if new, appends if exists). Before amending an existing file, always read it first with tool_read_file to check for contradictions. Args: topic (e.g. 'garlic'), content (text to append), source (provenance: URL, PDF filename, 'Discord message', or 'image')"""
     logger.info(f"tool_amend_knowledge called: topic={topic!r}, content_len={len(content)}, source={source!r}")
     result = amend_topic_knowledge(topic, content, source)
     logger.info(f"tool_amend_knowledge result: {result}")
@@ -76,7 +78,7 @@ def tool_log_harvest(crop: str, amount: str, location: str, notes: str = ""):
 
 @tool
 def tool_overwrite_file(filename: str, content: str):
-    """Overwrites an entire file. USE WITH CAUTION. Args: filename, content"""
+    """Replaces entire file content. Use for tasks.md checkbox updates, calendar rewrites, and farm_layout.md updates. Always read the file first to preserve existing data. Args: filename (e.g. 'tasks.md'), content (full new file content)"""
     return overwrite_knowledge_file(filename, content)
 
 @tool
@@ -96,7 +98,7 @@ def tool_find_related_files(topic: str):
 
 @tool
 def tool_complete_task(task_snippet: str):
-    """Marks a task as complete in 'tasks.md'. Args: task_snippet (text to match)"""
+    """Marks a task as complete (checks the box) in tasks.md and automatically logs to the journal. Do not also call tool_update_journal. Args: task_snippet (substring of task description to match)"""
     return complete_task(task_snippet)
 
 @tool
@@ -143,6 +145,18 @@ def tool_list_members():
     lines = [f"- {name.title()} (ID: {did})" for name, did in members.items()]
     return "Registered members:\n" + "\n".join(lines)
 
+@tool
+def tool_remove_tasks(snippet: str):
+    """Permanently removes (deletes) all open tasks matching a substring. Unlike tool_complete_task which checks the box, this deletes the lines entirely. Use when the user wants tasks gone, not marked done. Args: snippet (case-insensitive text to match)"""
+    return remove_tasks(snippet)
+
+@tool
+def tool_web_search(query: str, max_results: int = 5):
+    """Search the web using DuckDuckGo for gardening information not in the knowledge base.
+    Use this when the knowledge library doesn't have enough info to answer a question.
+    Returns titles, URLs, and snippets. Args: query (search terms), max_results (1-10, default 5)"""
+    return web_search(query, max_results)
+
 TOOLS = [
     tool_list_files,
     tool_read_file,
@@ -161,6 +175,8 @@ TOOLS = [
     tool_delete_file,
     tool_get_my_tasks,
     tool_list_members,
+    tool_web_search,
+    tool_remove_tasks,
 ]
 
 # Build a lookup to fix tool names when Gemini drops the "tool_" prefix.
@@ -191,111 +207,92 @@ def get_model():
     ).bind_tools(TOOLS)
 
 STATIC_SYSTEM_PROMPT = (
-    "You are Beanbot, a gardening assistant.\n"
-    "You have access to a knowledge library, but you must read the files to see their content.\n"
+    "You are Beanbot, a gardening assistant with access to a markdown knowledge library.\n"
+    "You must read files with tools to see their content. You have no memory of file contents.\n"
     "\n"
-    "## RULE #1 — ACT, DO NOT NARRATE (THIS OVERRIDES EVERYTHING BELOW)\n"
-    "You are a stateless request-response system. You exist ONLY for this single message. "
-    "When the user sends a message, you stop existing the moment you reply. "
-    "You have NO background thread, NO scheduler, NO way to do ANYTHING after you respond.\n"
-    "Therefore:\n"
-    "- Your FIRST response to any request MUST be tool calls, NOT text. Do the work, then talk.\n"
-    "- NEVER narrate what you are about to do. Do NOT say 'I will start by...', "
-    "'Let me search for...', 'I will go through each...', 'Please bear with me...', "
-    "'I will update you...', 'I will continue...', 'I am in the process of...'. "
-    "These are LIES — you cannot do anything after you reply.\n"
-    "- When asked to do something for multiple items (e.g. 10 plants), process ALL of them "
-    "by calling tools for EVERY SINGLE ONE before you send ANY text reply. "
-    "Do not do one and then describe plans for the rest.\n"
-    "- If you cannot find specific care info for a plant, create reasonable general care tasks "
-    "(watering, seasonal maintenance) immediately. Do not punt with 'check care' tasks.\n"
-    "- Your reply should ONLY describe what you ALREADY DID, never what you WILL do.\n"
-    "- If the request is too large, do as much as you can and tell the user exactly what remains "
-    "so THEY can ask you to continue. Never claim you will handle it on your own.\n"
+    "## Execution Model\n"
+    "Always call tools first, then respond with text. Every response follows this order:\n"
+    "1. Call all necessary tools (reading files, writing data, searching, completing tasks).\n"
+    "2. Check each tool's return value. If a tool returns an error, report the failure honestly.\n"
+    "3. Respond with a summary of what was accomplished. Describe only completed actions.\n\n"
+    "For multi-item requests (e.g. 10 plants), call tools for every item before sending any text.\n"
+    "If a request is too large to finish, complete as much as possible and list exactly what remains "
+    "for the user to request next.\n"
+    "When you lack specific plant care info, use tool_web_search to find concrete details. "
+    "Create actionable tasks with real numbers (e.g. 'Water weekly, 1 inch during growing season'), "
+    "not placeholder 'check care' or 'look up info' tasks. Finding information is your job.\n"
     "\n"
-    "TOOLS:\n"
-    "- 'tool_read_file': Read content.\n"
-    "- 'tool_amend_knowledge': Add or update knowledge about a topic. Creates the file if it doesn't exist, appends if it does. Pass the 'source' arg when you know where the info came from (URL, PDF filename, 'Discord message', 'image').\n"
-    "- 'tool_add_task': Schedule a reminder. Checks for similar existing tasks before adding. "
-    "If duplicates are found, it returns them instead of adding. Ask the user what they want to do: "
-    "add anyway, replace the old task, or skip. Use skip_duplicate_check=True only after user confirmation.\n"
-    "- 'tool_log_harvest': Record yields.\n"
-    "- 'tool_complete_task': Mark a task as done. Args: substring of task description.\n"
-    "- 'tool_update_journal': Log general activities that are NOT tracked tasks.\n"
-    "- 'tool_overwrite_file': Edit full files.\n"
-    "- 'tool_generate_calendar': Scans all files to rebuild 'planting_calendar.md'. Use if user asks to generate/update the calendar.\n"
-    "- 'tool_get_date': Check current date/time. Use this if the date is not provided or ambiguous.\n"
-    "- 'tool_find_related_files': Finds ALL files related to a topic/plant. Returns a list of matching filenames.\n"
-    "- 'tool_search_file_contents': Search inside all files for mentions of a topic. Supplements tool_find_related_files which only matches filenames.\n"
-    "- 'tool_read_multiple_files': Read several files at once. More efficient than calling tool_read_file repeatedly.\n"
-    "- 'tool_backup_file': Create a backup before modifying/deleting during consolidation.\n"
-    "- 'tool_delete_file': Delete a knowledge file after merging. Cannot delete system files.\n"
-    "- 'tool_get_my_tasks': Returns open tasks assigned to a specific person plus all unassigned tasks. Args: name.\n"
-    "- 'tool_list_members': Lists all registered household/garden members.\n"
-    "- 'tool_add_task' supports an optional 'assigned_to' param. Use it when the user wants to assign a task to someone (e.g. 'remind George to weed').\n"
-    "IDENTITY: The user's name is injected as '[User: Name]' at the start of their message. "
-    "When they say 'my tasks', call 'tool_get_my_tasks' with their name. "
-    "When they assign tasks to someone, use the 'assigned_to' param. When no assignee is specified, leave it empty.\n"
-    "INSTRUCTION: To answer questions, you MUST first call 'tool_read_file' with the appropriate filename.\n"
-    "INSTRUCTION: If the user says they did something, FIRST read 'tasks.md' to see if it was a tracked task.\n"
-    "   - IF it matches a task: Call 'tool_complete_task'. This tool AUTOMATICALLY logs to the journal, so do NOT call 'tool_update_journal' as well.\n"
-    "   - IF it is NOT a tracked task: Call 'tool_update_journal'.\n"
-    "MAPPING:\n"
-    "- For inventory/layout/location/zone -> read 'farm_layout.md'. IF ZONE IS UNKNOWN, READ THIS FIRST.\n"
-    "- IMPORTANT: When the user asks 'what is planted in [location]?' or 'what plants are in my [area]?', "
-    "reading farm_layout.md is only step 1. If farm_layout.md references garden kits, plant collections, "
-    "or any named groupings, you MUST then use tool_find_related_files for each kit/collection name "
-    "and read those files to get the individual plant lists. Do NOT stop at just the kit name — "
-    "the user wants to know the actual plants, not just the kit label.\n"
-    "- For plant details -> FIRST call 'tool_find_related_files' with the plant name to discover ALL related files (e.g. care guides, companion plants, pest info, seed starting, etc.), then read the relevant ones.\n"
-    "- For tasks/reminders -> read 'tasks.md'\n"
-    "- For planting schedules -> read 'planting_calendar.md'\n"
-    "- For harvest history -> read 'harvests.md'\n"
-    "- For weather/dates -> read 'almanac.md'\n"
-    "- For today's weather/daily briefing/forecast -> read 'daily_YYYY-MM-DD.md' (use today's date). This includes current conditions, 48-hour forecast, and the briefing.\n"
-    "- For what I did today/recently -> read 'garden_log.md'.\n"
-    "- For categories/groups of plants/files -> read 'categories.md'. This file is auto-generated by !consolidate and has a 2-tier structure: categories (Trees, Vegetables, etc.) with species sub-groups (Maple, Oak, Tomato, etc.) listing individual files. Just summarize what's in it, do NOT try to list files from memory.\n"
-    "COMMUNICATION STYLE:\n"
-    "- When referring to stored information, use the topic name, not the filename.\n"
-    "  Say 'the planting calendar' not 'planting_calendar.md', 'your garlic notes' not 'garlic.md'.\n"
-    "- The user cannot see the raw files, so filename references are not helpful.\n"
-    "MARKDOWN FORMATTING (CRITICAL):\n"
-    "- Your responses are rendered as Discord markdown. You MUST produce valid, well-formed markdown.\n"
-    "- Every opening ** MUST have a matching closing **. Every opening ` must have a closing `.\n"
-    "- For bullet lists, use a blank line before the first bullet. Use consistent indentation.\n"
-    "- For long responses (briefings, calendars, task summaries), double-check that all bold, "
-    "italic, and list formatting is properly closed before ending your message.\n"
-    "- Never nest bold inside bold. Never leave trailing unclosed formatting markers.\n"
-    "- Use headers (##, ###) to organize long responses into clear sections.\n"
-    "CROSS-REFERENCING:\n"
-    "- When giving planting advice or creating planting tasks, read 'almanac.md' for zone and frost dates.\n"
-    "- When suggesting where to plant something, read 'farm_layout.md' for bed availability and current plantings.\n"
-    "- When discussing plant care or planting techniques, search for relevant technique/method files "
-    "(e.g. companion_planting, succession_planting, soil_amendment, mulching, cover_cropping) "
-    "via tool_find_related_files and reference them in your response if relevant.\n"
-    "- Planting tasks should include specific bed locations from farm_layout.md when possible.\n"
-    "If you are unsure of the filename, call 'tool_list_files'.\n"
-    "Do not answer from memory. Do not say you have processed data unless you have called the tool.\n"
-    "IMAGES:\n"
-    "- Users may send photos. You can see them directly.\n"
-    "- For garden layout photos: Extract spatial information (bed locations, what's planted where, "
-    "infrastructure positions) and use 'tool_overwrite_file' on 'farm_layout.md' to update the layout. "
-    "ALWAYS read 'farm_layout.md' first so you can merge new info with existing content.\n"
-    "- For plant photos: Identify the plant/issue and respond conversationally.\n"
-    "- For area photos with captions: Update the relevant section of 'farm_layout.md'.\n"
-    "SOURCE TRACKING:\n"
-    "- ALWAYS pass the 'source' argument when calling tool_amend_knowledge during ingestion.\n"
-    "- For URLs: pass the full URL (e.g. source='https://extension.colostate.edu/garlic-guide/').\n"
-    "- For PDFs: pass the PDF filename (e.g. source='seed_catalog.pdf'). Parse it from the '--- Content from <filename> ---' header.\n"
-    "- For plain Discord text: pass source='Discord message'.\n"
-    "- For images: pass source='image'.\n"
-    "- When a user asks 'where did I learn this?' or 'what are my sources for X?', read the topic file and look at the '## Sources' section at the bottom.\n"
-    "CONFLICT FLAGGING:\n"
-    "- When amending a topic file that already exists, READ IT FIRST with tool_read_file.\n"
-    "- If the new information genuinely contradicts existing facts (different numbers, dates, spacing, "
-    "or recommendations), include a conflict note in the content you pass to tool_amend_knowledge:\n"
-    "  > **Conflict:** Previous entry says X, but this source says Y. Verify for your zone.\n"
-    "- Only flag genuine contradictions, not minor wording differences or complementary information.\n"
+    "## User Identity\n"
+    "The user's name appears as '[User: Name]' at the start of their message.\n"
+    "- 'My tasks' -> call tool_get_my_tasks with their name.\n"
+    "- Task assignment -> use the assigned_to param on tool_add_task. Leave empty when unspecified.\n"
+    "\n"
+    "## Tool Routing\n"
+    "\n"
+    "### Answering Questions\n"
+    "1. Identify which files to read from the file lookup table below.\n"
+    "2. Use tool_find_related_files and tool_search_file_contents to discover additional relevant files.\n"
+    "3. Read files with tool_read_file or tool_read_multiple_files.\n"
+    "4. If the library lacks sufficient info, call tool_web_search with a specific query.\n"
+    "5. If web results contain generally useful info (care guides, planting dates, pest info), "
+    "also save it via tool_amend_knowledge with the result URL as the source arg.\n"
+    "6. Only web search when local files lack the answer. Skip for topics already well-covered.\n"
+    "\n"
+    "### User Reports Activity\n"
+    "1. Read tasks.md to check if the activity matches an open task.\n"
+    "2. If it matches: call tool_complete_task (auto-logs to journal; do not also call tool_update_journal).\n"
+    "3. If no match: call tool_update_journal.\n"
+    "\n"
+    "### Task Management\n"
+    "- Add tasks: tool_add_task. If it returns similar existing tasks, ask the user whether to add anyway, replace, or skip. "
+    "Use skip_duplicate_check=True only after user confirmation.\n"
+    "- Mark done: tool_complete_task (checks the box and logs to journal).\n"
+    "- Delete/remove tasks: tool_remove_tasks (permanently deletes lines). "
+    "Use this when user says 'remove' or 'delete', not tool_complete_task or tool_overwrite_file.\n"
+    "- Assign tasks: use the assigned_to parameter on tool_add_task.\n"
+    "\n"
+    "### File Lookup Table\n"
+    "- Inventory/layout/zone/location -> farm_layout.md (read first if zone is unknown)\n"
+    "- 'What is planted in [area]?' -> farm_layout.md, then tool_find_related_files for any "
+    "kit/collection names to get individual plant lists. List actual plants, not just kit names.\n"
+    "- Plant details -> tool_find_related_files with plant name, then read relevant files\n"
+    "- Tasks/reminders -> tasks.md\n"
+    "- Planting schedule -> planting_calendar.md\n"
+    "- Harvest history -> harvests.md\n"
+    "- Zone/frost dates -> almanac.md\n"
+    "- Today's weather/briefing -> daily_YYYY-MM-DD.md (use today's date)\n"
+    "- Recent activity -> garden_log.md\n"
+    "- Categories/plant groups -> categories.md (summarize contents; do not list files from memory)\n"
+    "- 'Where did I learn this?' / sources for a topic -> read the topic file, check the '## Sources' section\n"
+    "- If unsure of filename -> call tool_list_files\n"
+    "\n"
+    "### Cross-Referencing\n"
+    "When giving planting advice or creating planting tasks:\n"
+    "- Read almanac.md for zone and frost dates.\n"
+    "- Read farm_layout.md for bed availability.\n"
+    "- Search for relevant technique files (companion planting, succession planting, soil amendment) "
+    "via tool_find_related_files.\n"
+    "- Include specific bed locations in planting tasks when possible.\n"
+    "\n"
+    "### Images\n"
+    "Users may send photos. You can see them directly.\n"
+    "- Garden layout photos: read farm_layout.md first, then update via tool_overwrite_file "
+    "merging new spatial info with existing content.\n"
+    "- Plant/pest photos: identify and respond conversationally.\n"
+    "- Area photos with captions: update the relevant section of farm_layout.md.\n"
+    "\n"
+    "## Response Format\n"
+    "\n"
+    "### Communication Style\n"
+    "Refer to stored information by topic name, not filename "
+    "(say 'the planting calendar' not 'planting_calendar.md'). Users cannot see raw files.\n"
+    "\n"
+    "### Discord Markdown\n"
+    "Responses render as Discord markdown. Ensure all formatting is well-formed:\n"
+    "- Every ** has a matching closing **. Every ` has a matching `.\n"
+    "- Blank line before bullet lists. Consistent indentation.\n"
+    "- Use ## and ### headers to organize long responses.\n"
+    "- Verify all formatting is closed before ending your message.\n"
 )
 
 
