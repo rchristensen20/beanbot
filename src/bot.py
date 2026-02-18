@@ -1577,32 +1577,33 @@ class BeanBot(commands.Bot):
 
             thinking_task = asyncio.create_task(_thinking_fallback())
 
-            async for update in asyncio.wait_for(stream, timeout=LLM_TIMEOUT):
-                if "agent" in update:
-                    agent_msgs = update["agent"].get("messages", [])
-                    if not agent_msgs:
-                        continue
-                    last_msg = agent_msgs[-1]
+            async with asyncio.timeout(LLM_TIMEOUT):
+                async for update in stream:
+                    if "agent" in update:
+                        agent_msgs = update["agent"].get("messages", [])
+                        if not agent_msgs:
+                            continue
+                        last_msg = agent_msgs[-1]
 
-                    tool_calls = getattr(last_msg, "tool_calls", None)
-                    if tool_calls:
-                        # Agent requested tool calls — update tracker
-                        tool_names = [tc.get("name", "") for tc in tool_calls]
-                        tracker.on_agent_output(tool_names)
-                        if thinking_task and not thinking_task.done():
-                            thinking_task.cancel()
+                        tool_calls = getattr(last_msg, "tool_calls", None)
+                        if tool_calls:
+                            # Agent requested tool calls — update tracker
+                            tool_names = [tc.get("name", "") for tc in tool_calls]
+                            tracker.on_agent_output(tool_names)
+                            if thinking_task and not thinking_task.done():
+                                thinking_task.cancel()
+                            await _post_or_edit_progress()
+                        else:
+                            # Final text response (no tool calls)
+                            text = self._extract_text(last_msg.content)
+                            tracker.on_final_response(text)
+                            if thinking_task and not thinking_task.done():
+                                thinking_task.cancel()
+
+                    elif "tools" in update:
+                        tool_msgs = update["tools"].get("messages", [])
+                        tracker.on_tools_complete(len(tool_msgs))
                         await _post_or_edit_progress()
-                    else:
-                        # Final text response (no tool calls)
-                        text = self._extract_text(last_msg.content)
-                        tracker.on_final_response(text)
-                        if thinking_task and not thinking_task.done():
-                            thinking_task.cancel()
-
-                elif "tools" in update:
-                    tool_msgs = update["tools"].get("messages", [])
-                    tracker.on_tools_complete(len(tool_msgs))
-                    await _post_or_edit_progress()
 
             # Cancel thinking fallback if still pending
             if thinking_task and not thinking_task.done():
@@ -1659,20 +1660,18 @@ class BeanBot(commands.Bot):
         """
         try:
             final_text = ""
-            async for update in asyncio.wait_for(
-                graph_module.app_graph.astream(
+            async with asyncio.timeout(LLM_TIMEOUT):
+                async for update in graph_module.app_graph.astream(
                     inputs, config=config, stream_mode="updates"
-                ),
-                timeout=LLM_TIMEOUT,
-            ):
-                if "agent" in update:
-                    agent_msgs = update["agent"].get("messages", [])
-                    if not agent_msgs:
-                        continue
-                    last_msg = agent_msgs[-1]
-                    tool_calls = getattr(last_msg, "tool_calls", None)
-                    if not tool_calls:
-                        final_text = self._extract_text(last_msg.content)
+                ):
+                    if "agent" in update:
+                        agent_msgs = update["agent"].get("messages", [])
+                        if not agent_msgs:
+                            continue
+                        last_msg = agent_msgs[-1]
+                        tool_calls = getattr(last_msg, "tool_calls", None)
+                        if not tool_calls:
+                            final_text = self._extract_text(last_msg.content)
 
             return final_text or "I wasn't able to generate a response. Please try again."
         except asyncio.TimeoutError:
