@@ -47,6 +47,8 @@ A personal gardening assistant Discord bot powered by an agentic AI workflow.
 
 - **Clear & reset commands** — `!clear <topic>` deletes a single file (2-step confirm), `!clear knowledge` wipes all non-system files (3-step), `!clear garden` factory-resets everything (3-step).
 
+- **Context window optimization** — Old conversation turns are automatically truncated before sending to the LLM. Bulky tool results (file reads), large ingestion payloads, and base64 images from previous turns are trimmed to save tokens while keeping the current turn fully intact.
+
 - **Database maintenance** — Nightly pruning of conversation checkpoints. Ephemeral threads (daily reports, debriefs) are cleaned up after 7 days; persistent threads are trimmed to the last 20 checkpoints.
 
 - **Docker deployment** — single `docker-compose up` with volume persistence.
