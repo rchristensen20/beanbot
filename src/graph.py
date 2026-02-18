@@ -65,11 +65,12 @@ def tool_amend_knowledge(topic: str, content: str, source: str = ""):
     return result
 
 @tool
-def tool_add_task(task_description: str, due_date: str = "", assigned_to: str = "", skip_duplicate_check: bool = False):
+def tool_add_task(task_description: str, due_date: str = "", assigned_to: str = "", skip_duplicate_check: bool = False, recurring: str = ""):
     """Adds a task to the tracker. Checks for similar existing tasks first.
     Args: task_description (text), due_date (YYYY-MM-DD, optional), assigned_to (name, optional),
-    skip_duplicate_check (set True to force-add even if similar tasks exist)"""
-    return add_task(task_description, due_date, assigned_to, skip_duplicate_check)
+    skip_duplicate_check (set True to force-add even if similar tasks exist),
+    recurring (recurrence pattern, optional: daily, weekly, monthly, every N days, every N weeks — requires due_date)"""
+    return add_task(task_description, due_date, assigned_to, skip_duplicate_check, recurring)
 
 @tool
 def tool_log_harvest(crop: str, amount: str, location: str, notes: str = ""):
@@ -252,6 +253,10 @@ STATIC_SYSTEM_PROMPT = (
     "- Delete/remove tasks: tool_remove_tasks (permanently deletes lines). "
     "Use this when user says 'remove' or 'delete', not tool_complete_task or tool_overwrite_file.\n"
     "- Assign tasks: use the assigned_to parameter on tool_add_task.\n"
+    "- Recurring tasks: use the `recurring` param on tool_add_task for repeating tasks like watering, "
+    "feeding, fertilizing. Valid patterns: daily, weekly, monthly, every N days, every N weeks. "
+    "Recurring tasks REQUIRE a due_date. When a recurring task is completed, the next occurrence is "
+    "auto-created — do NOT manually re-create it.\n"
     "\n"
     "### File Lookup Table\n"
     "- Inventory/layout/zone/location -> farm_layout.md (read first if zone is unknown)\n"

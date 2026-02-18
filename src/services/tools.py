@@ -3,7 +3,7 @@ import glob
 import json
 import re
 import shutil
-from datetime import datetime
+from datetime import date, datetime, timedelta
 import logging
 
 logger = logging.getLogger(__name__)
@@ -258,7 +258,7 @@ def amend_topic_knowledge(topic: str, content: str, source: str = "") -> str:
         logger.error(f"Failed to write to {path}: {e}")
         return f"Error updating topic file: {str(e)}"
 
-def add_task(task_description: str, due_date: str = "", assigned_to: str = "", skip_duplicate_check: bool = False) -> str:
+def add_task(task_description: str, due_date: str = "", assigned_to: str = "", skip_duplicate_check: bool = False, recurring: str = "") -> str:
     """
     Adds a task to the task list.
     Args:
@@ -266,9 +266,17 @@ def add_task(task_description: str, due_date: str = "", assigned_to: str = "", s
         due_date: Optional due date in YYYY-MM-DD format.
         assigned_to: Optional name of the person this task is assigned to.
         skip_duplicate_check: If True, skip duplicate detection and add directly.
+        recurring: Optional recurrence pattern (daily, weekly, monthly, every N days, every N weeks).
     """
     filename = "tasks.md"
     path = os.path.join(DATA_DIR, filename)
+
+    # Validate recurrence
+    if recurring.strip():
+        if _parse_recurrence(recurring) is None:
+            return f"Invalid recurrence pattern '{recurring}'. Valid patterns: {VALID_RECURRENCE_PATTERNS}"
+        if not due_date:
+            return f"Recurring tasks require a due_date. Please provide a due date in YYYY-MM-DD format."
 
     if not skip_duplicate_check:
         existing = get_open_tasks()
@@ -284,8 +292,9 @@ def add_task(task_description: str, due_date: str = "", assigned_to: str = "", s
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     assigned_str = f" [Assigned: {assigned_to.strip()}]" if assigned_to.strip() else ""
+    recurring_str = f" [Recurring: {recurring.strip()}]" if recurring.strip() else ""
     due_str = f" [Due: {due_date}]" if due_date else ""
-    formatted_entry = f"\n- [ ] {task_description}{assigned_str}{due_str} (Created: {timestamp})"
+    formatted_entry = f"\n- [ ] {task_description}{assigned_str}{recurring_str}{due_str} (Created: {timestamp})"
 
     try:
         if not os.path.exists(path):
@@ -438,8 +447,73 @@ _STOP_WORDS = frozenset({
 })
 
 _TASK_METADATA_RE = re.compile(
-    r'\[Assigned:\s*[^\]]*\]|\[Due:\s*[^\]]*\]|\(Created:\s*[^\)]*\)|^- \[.\]\s*',
+    r'\[Assigned:\s*[^\]]*\]|\[Due:\s*[^\]]*\]|\[Recurring:\s*[^\]]*\]|\(Created:\s*[^\)]*\)|^- \[.\]\s*',
 )
+
+_RECURRENCE_RE = re.compile(r'\[Recurring:\s*([^\]]+)\]', re.IGNORECASE)
+
+_EVERY_N_RE = re.compile(r'every\s+(\d+)\s+(day|week)s?', re.IGNORECASE)
+
+VALID_RECURRENCE_PATTERNS = "daily, weekly, monthly, every N days, every N weeks"
+
+
+def _parse_recurrence(pattern: str) -> timedelta | str | None:
+    """Parse a recurrence pattern string into a timedelta or 'monthly' sentinel.
+
+    Returns None if the pattern is invalid.
+    """
+    p = pattern.strip().lower()
+    if p == "daily":
+        return timedelta(days=1)
+    if p == "weekly":
+        return timedelta(weeks=1)
+    if p == "monthly":
+        return "monthly"
+    m = _EVERY_N_RE.fullmatch(p)
+    if m:
+        n = int(m.group(1))
+        if n < 1:
+            return None
+        unit = m.group(2).lower()
+        if unit == "day":
+            return timedelta(days=n)
+        if unit == "week":
+            return timedelta(weeks=n)
+    return None
+
+
+def _compute_next_due(current_due_str: str, pattern: str, today: date | None = None) -> str:
+    """Compute the next due date for a recurring task.
+
+    Uses max(current_due, today) as the base so overdue tasks don't reschedule into the past.
+    Monthly handles month-end clamping (e.g. Jan 31 → Feb 28).
+
+    Returns the next due date as a YYYY-MM-DD string.
+    """
+    if today is None:
+        today = date.today()
+
+    current_due = date.fromisoformat(current_due_str)
+    base = max(current_due, today)
+
+    delta = _parse_recurrence(pattern)
+    if delta is None:
+        return ""
+
+    if delta == "monthly":
+        # Advance by one month with day clamping
+        import calendar
+        month = base.month + 1
+        year = base.year
+        if month > 12:
+            month = 1
+            year += 1
+        max_day = calendar.monthrange(year, month)[1]
+        day = min(base.day, max_day)
+        return date(year, month, day).isoformat()
+
+    next_date = base + delta
+    return next_date.isoformat()
 
 
 def _find_similar_tasks(description: str, existing_tasks: list[str], threshold: float = 0.5) -> list[str]:
@@ -822,23 +896,51 @@ def complete_task(task_snippet: str) -> str:
         if found:
             with open(path, "w") as f:
                 f.writelines(new_lines)
-            
+
             # Auto-log to garden journal
             # Extract clean task description for the log
             # Line format: "- [ ] Description [Due: ...] (Created: ...)\n"
             clean_desc = task_snippet # Default fallback
+            matched_line = ""
             # Try to get the actual line content
             for line in lines:
                  if "- [ ]" in line and task_snippet.lower() in line.lower():
+                     matched_line = line
                      # Remove "- [ ] "
                      parts = line.split("- [ ] ", 1)
                      if len(parts) > 1:
                          clean_desc = parts[1].strip()
                      break
-            
+
             update_journal(f"Completed task: {clean_desc}")
-            
-            return f"Successfully marked task matching '{task_snippet}' as complete and logged to journal."
+
+            result_msg = f"Successfully marked task matching '{task_snippet}' as complete and logged to journal."
+
+            # Auto-reschedule recurring tasks
+            if matched_line:
+                recurrence_match = _RECURRENCE_RE.search(matched_line)
+                if recurrence_match:
+                    pattern = recurrence_match.group(1).strip()
+                    due_match = re.search(r'\[Due:\s*(\d{4}-\d{2}-\d{2})\]', matched_line)
+                    if due_match:
+                        next_due = _compute_next_due(due_match.group(1), pattern)
+                        if next_due:
+                            # Extract assignee if present
+                            assigned_match = re.search(r'\[Assigned:\s*([^\]]+)\]', matched_line)
+                            assignee = assigned_match.group(1).strip() if assigned_match else ""
+                            # Extract clean description (strip all metadata)
+                            desc = re.sub(r'^- \[[ x]\] ', '', matched_line.strip())
+                            desc = re.sub(r'\s*\[Assigned:\s*[^\]]*\]', '', desc)
+                            desc = re.sub(r'\s*\[Recurring:\s*[^\]]*\]', '', desc)
+                            desc = re.sub(r'\s*\[Due:\s*[^\]]*\]', '', desc)
+                            desc = re.sub(r'\s*\(Created:\s*[^)]*\)', '', desc).strip()
+                            add_task(desc, due_date=next_due, assigned_to=assignee,
+                                     skip_duplicate_check=True, recurring=pattern)
+                            result_msg += f" Next occurrence scheduled for {next_due}."
+                    else:
+                        result_msg += " Warning: recurring task has no [Due:] date — cannot reschedule."
+
+            return result_msg
         else:
             return f"No pending task found matching '{task_snippet}'."
             

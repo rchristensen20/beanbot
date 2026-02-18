@@ -78,12 +78,14 @@ BOT_VERSION = _read_version()
 def _extract_task_description(task_line: str) -> str:
     """Strip metadata from a raw task line for clean display in the debrief Select menu.
 
-    Input:  '- [ ] Water the tomatoes [Assigned: Ryan] [Due: 2025-06-15] (Created: 2025-06-14 08:30:00)'
-    Output: 'Water the tomatoes (Due: Jun 15)'
+    Input:  '- [ ] Water the tomatoes [Assigned: Ryan] [Recurring: daily] [Due: 2025-06-15] (Created: 2025-06-14 08:30:00)'
+    Output: 'Water the tomatoes (Due: Jun 15) 🔁'
     """
     text = task_line.strip()
     # Remove checkbox prefix
     text = re.sub(r'^- \[[ x]\] ', '', text)
+    # Detect recurring before stripping
+    is_recurring = bool(re.search(r'\[Recurring:\s*[^\]]*\]', text))
     # Extract due date before stripping
     due_match = re.search(r'\[Due:\s*(\d{4}-\d{2}-\d{2})\]', text)
     due_suffix = ""
@@ -95,9 +97,13 @@ def _extract_task_description(task_line: str) -> str:
             due_suffix = f" (Due: {due_match.group(1)})"
     # Strip metadata tags
     text = re.sub(r'\s*\[Assigned:\s*[^\]]*\]', '', text)
+    text = re.sub(r'\s*\[Recurring:\s*[^\]]*\]', '', text)
     text = re.sub(r'\s*\[Due:\s*[^\]]*\]', '', text)
     text = re.sub(r'\s*\(Created:\s*[^)]*\)', '', text)
-    return (text.strip() + due_suffix).strip()
+    result = (text.strip() + due_suffix).strip()
+    if is_recurring:
+        result += " \U0001f501"
+    return result
 
 
 def _extract_task_description_numbered(num: int, desc: str) -> str:
@@ -742,9 +748,10 @@ class TaskConsolidateView(discord.ui.View):
                     # Fallback: keep the first task
                     indices_to_remove.discard(group_indices[0])
                     continue
-                # Collect assignees from original tasks
+                # Collect assignees and recurring pattern from original tasks
                 assignees: set[str] = set()
                 earliest_due = None
+                recurring_pattern = ""
                 for idx in group_indices:
                     task = self.all_tasks[idx]
                     assigned_match = re.search(r'\[Assigned:\s*([^\]]+)\]', task)
@@ -755,13 +762,19 @@ class TaskConsolidateView(discord.ui.View):
                         d = due_match.group(1)
                         if earliest_due is None or d < earliest_due:
                             earliest_due = d
+                    if not recurring_pattern:
+                        rec_match = re.search(r'\[Recurring:\s*([^\]]+)\]', task)
+                        if rec_match:
+                            recurring_pattern = rec_match.group(1).strip()
 
                 # Strip any existing metadata from suggested merge
                 clean_suggested = re.sub(r'\s*\[Assigned:\s*[^\]]*\]', '', suggested)
+                clean_suggested = re.sub(r'\s*\[Recurring:\s*[^\]]*\]', '', clean_suggested)
                 clean_suggested = re.sub(r'\s*\[Due:\s*[^\]]*\]', '', clean_suggested)
                 clean_suggested = re.sub(r'\s*\(Created:\s*[^)]*\)', '', clean_suggested)
                 clean_suggested = re.sub(r'^- \[[ x]\] ', '', clean_suggested).strip()
 
+                recurring_str = f" [Recurring: {recurring_pattern}]" if recurring_pattern else ""
                 due_str = f" [Due: {earliest_due}]" if earliest_due else ""
                 now_str = datetime.now(BOT_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -769,16 +782,16 @@ class TaskConsolidateView(discord.ui.View):
                     # Multiple assignees: create one line per assignee
                     for assignee in sorted(assignees):
                         new_merged_lines.append(
-                            f"- [ ] {clean_suggested} [Assigned: {assignee}]{due_str} (Created: {now_str})"
+                            f"- [ ] {clean_suggested} [Assigned: {assignee}]{recurring_str}{due_str} (Created: {now_str})"
                         )
                 elif len(assignees) == 1:
                     assignee = next(iter(assignees))
                     new_merged_lines.append(
-                        f"- [ ] {clean_suggested} [Assigned: {assignee}]{due_str} (Created: {now_str})"
+                        f"- [ ] {clean_suggested} [Assigned: {assignee}]{recurring_str}{due_str} (Created: {now_str})"
                     )
                 else:
                     new_merged_lines.append(
-                        f"- [ ] {clean_suggested}{due_str} (Created: {now_str})"
+                        f"- [ ] {clean_suggested}{recurring_str}{due_str} (Created: {now_str})"
                     )
                 merge_count += 1
 
@@ -1762,14 +1775,51 @@ class BeanBot(commands.Bot):
                 "and list unassigned tasks in a separate 'Unassigned' section. Use the member names exactly as shown.\n"
             )
 
+        # Pre-filter tasks to today/overdue instead of having the LLM read all 50+ tasks
+        all_open = get_open_tasks()
+        urgent_tasks = filter_tasks_due_today_or_overdue(all_open, today)
+
+        # Build task section for the prompt, grouped by assignee
+        task_section = ""
+        if urgent_tasks:
+            if members:
+                # Group by assignee
+                assigned_re = re.compile(r'\[Assigned:\s*([^\]]+)\]', re.IGNORECASE)
+                by_assignee: dict[str, list[str]] = {}
+                for task in urgent_tasks:
+                    m = assigned_re.search(task)
+                    assignee = m.group(1).strip() if m else "Unassigned"
+                    by_assignee.setdefault(assignee, []).append(_extract_task_description(task))
+                parts = []
+                for assignee, descs in sorted(by_assignee.items()):
+                    parts.append(f"**{assignee}:**")
+                    for desc in descs:
+                        parts.append(f"  - {desc}")
+                task_section = "\n".join(parts)
+            else:
+                task_section = "\n".join(
+                    f"- {_extract_task_description(t)}" for t in urgent_tasks
+                )
+
+        task_block = ""
+        if task_section:
+            task_block = (
+                f"\n\nTASKS DUE TODAY OR OVERDUE ({len(urgent_tasks)} of {len(all_open)} total open tasks):\n"
+                f"{task_section}\n"
+            )
+        else:
+            task_block = "\n\nTASKS: No tasks due today or overdue.\n"
+
         prompt = (
             f"Generate the daily morning briefing.\n"
             f"Today's Date: {today}\n"
             f"Current Weather: {weather_data}\n"
-            f"Forecast: {forecast['summary']}\n\n"
-            "INSTRUCTION: Read the 'garden_log.md', 'tasks.md', 'planting_calendar.md', and 'almanac.md' files using your tools.\n"
+            f"Forecast: {forecast['summary']}\n"
+            f"{task_block}\n"
+            "INSTRUCTION: Read the 'garden_log.md', 'planting_calendar.md', and 'almanac.md' files using your tools.\n"
+            "The tasks due today/overdue are already listed above — do NOT read tasks.md.\n"
             "Analyze the information to identify:\n"
-            "1. Urgent tasks due today/soon (from tasks.md)\n"
+            "1. Urgent tasks from the list above\n"
             "2. Planting actions based on weather/season (from planting_calendar.md)\n"
             "3. Recent log context (from garden_log.md)\n"
             "4. Weather-based advice based on the forecast\n"

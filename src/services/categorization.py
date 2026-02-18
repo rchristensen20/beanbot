@@ -225,6 +225,8 @@ async def analyze_duplicate_tasks(open_tasks: list[str]) -> list[dict]:
         "- Do NOT group tasks just because they involve the same plant or area\n"
         "- Each task can appear in at most ONE group\n"
         "- Tasks assigned to different people doing the SAME work ARE duplicates\n"
+        "- Tasks with DIFFERENT [Recurring: ...] patterns are NOT duplicates\n"
+        "- A recurring task and a non-recurring task with the same description are NOT duplicates\n"
         "- 'duplicate' = essentially identical tasks; 'similar' = overlapping scope that could be merged\n"
         "- For suggested_merge: write a single clean task line combining the best details from the group. "
         "Preserve any [Assigned: ...] and [Due: ...] tags from the EARLIEST due date. "
