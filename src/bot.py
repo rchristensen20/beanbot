@@ -21,6 +21,7 @@ import src.graph as graph_module
 from src.services.tools import read_knowledge_file, get_open_tasks, find_related_files, search_file_contents, build_library_index, get_library_files, is_onboarding_complete, register_member, get_member_name_by_discord_id, list_members, get_tasks_for_user, get_clearable_knowledge_files, clear_all_knowledge_files, clear_entire_garden, delete_knowledge_file, complete_task, filter_tasks_due_today_or_overdue, backup_file, overwrite_knowledge_file, _sanitize_topic, SYSTEM_FILES, DATA_DIR
 from src.services.categorization import categorize_files, derive_merge_suggestions, analyze_duplicate_tasks
 from src.services.weather import fetch_current_weather, fetch_forecast
+from src.services.progress import ProgressTracker
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -1459,25 +1460,31 @@ class BeanBot(commands.Bot):
             # Process as conversational LLM request ONLY if it is not a command
             ctx = await self.get_context(message)
             if not ctx.valid:
-                async with message.channel.typing():
-                    content = message.content.replace(f"<@{self.user.id}>", "").strip()
+                content = message.content.replace(f"<@{self.user.id}>", "").strip()
 
-                    # Inject user identity if registered
-                    user_name = get_member_name_by_discord_id(message.author.id)
-                    if user_name:
-                        content = f"[User: {user_name.title()}] {content}"
+                # Inject user identity if registered
+                user_name = get_member_name_by_discord_id(message.author.id)
+                if user_name:
+                    content = f"[User: {user_name.title()}] {content}"
 
-                    # Extract image attachments
-                    image_data = await self._extract_images(message)
+                # Extract image attachments
+                image_data = await self._extract_images(message)
 
-                    # Determine "context" based on channel
-                    channel_type = "dm"
-                    if is_journal: channel_type = "journal"
-                    elif is_question: channel_type = "questions"
-                    elif is_dm and not is_onboarding_complete():
-                        channel_type = "onboarding"
+                # Determine "context" based on channel
+                channel_type = "dm"
+                if is_journal: channel_type = "journal"
+                elif is_question: channel_type = "questions"
+                elif is_dm and not is_onboarding_complete():
+                    channel_type = "onboarding"
 
-                    response = await self.process_llm_request(content, channel_type, thread_id=str(message.channel.id), images=image_data)
+                response = await self.process_llm_request(
+                    content, channel_type,
+                    thread_id=str(message.channel.id),
+                    images=image_data,
+                    progress_message=message,
+                )
+                # Non-empty return means response was NOT posted by progress tracker
+                if response:
                     await self._send_long_reply(message, response)
         
         await self.process_commands(message)
@@ -1518,10 +1525,181 @@ class BeanBot(commands.Bot):
                     logger.error(f"Failed to read image attachment {att.filename}: {e}")
         return image_data
 
-    async def process_llm_request(self, user_input: str, channel_type: str, thread_id: str = "", images: list[dict] | None = None) -> str:
+    async def _stream_with_progress(
+        self,
+        inputs: dict,
+        config: dict,
+        message: "discord.Message",
+    ) -> str:
+        """Stream LangGraph execution with a live-updating progress bar.
+
+        Posts a progress message once tool calls begin (or after a 3-second
+        delay for slow no-tool responses), edits it in-place as tools run,
+        then replaces it with the final response text.
+
+        Returns empty string when the response was already posted via the
+        progress message edit, or the response text if it was never posted.
+        """
+        tracker = ProgressTracker()
+        progress_msg: discord.Message | None = None
+        last_edit_time: float = 0
+        EDIT_INTERVAL = 1.5  # seconds between Discord message edits
+        THINKING_DELAY = 3.0  # seconds before showing "Thinking..." fallback
+
+        async def _post_or_edit_progress():
+            nonlocal progress_msg, last_edit_time
+            now = asyncio.get_event_loop().time()
+            if progress_msg is None:
+                try:
+                    progress_msg = await message.reply(tracker.render_status())
+                    last_edit_time = now
+                except Exception as e:
+                    logger.error(f"Failed to post progress message: {e}")
+            elif now - last_edit_time >= EDIT_INTERVAL:
+                try:
+                    await progress_msg.edit(content=tracker.render_status())
+                    last_edit_time = now
+                except Exception as e:
+                    logger.debug(f"Failed to edit progress message: {e}")
+
+        try:
+            stream = graph_module.app_graph.astream(
+                inputs, config=config, stream_mode="updates"
+            )
+
+            thinking_task: asyncio.Task | None = None
+
+            async def _thinking_fallback():
+                """If no tools fire within THINKING_DELAY, show 'Thinking...'."""
+                await asyncio.sleep(THINKING_DELAY)
+                if tracker.phase == "thinking" and progress_msg is None:
+                    await _post_or_edit_progress()
+
+            thinking_task = asyncio.create_task(_thinking_fallback())
+
+            async for update in asyncio.wait_for(stream, timeout=LLM_TIMEOUT):
+                if "agent" in update:
+                    agent_msgs = update["agent"].get("messages", [])
+                    if not agent_msgs:
+                        continue
+                    last_msg = agent_msgs[-1]
+
+                    tool_calls = getattr(last_msg, "tool_calls", None)
+                    if tool_calls:
+                        # Agent requested tool calls — update tracker
+                        tool_names = [tc.get("name", "") for tc in tool_calls]
+                        tracker.on_agent_output(tool_names)
+                        if thinking_task and not thinking_task.done():
+                            thinking_task.cancel()
+                        await _post_or_edit_progress()
+                    else:
+                        # Final text response (no tool calls)
+                        text = self._extract_text(last_msg.content)
+                        tracker.on_final_response(text)
+                        if thinking_task and not thinking_task.done():
+                            thinking_task.cancel()
+
+                elif "tools" in update:
+                    tool_msgs = update["tools"].get("messages", [])
+                    tracker.on_tools_complete(len(tool_msgs))
+                    await _post_or_edit_progress()
+
+            # Cancel thinking fallback if still pending
+            if thinking_task and not thinking_task.done():
+                thinking_task.cancel()
+
+        except asyncio.TimeoutError:
+            logger.error(f"LangGraph execution timed out after {LLM_TIMEOUT} seconds")
+            tracker.on_error("Timed out — please try again in a moment.")
+        except Exception as e:
+            logger.error(f"Error in LangGraph streaming: {e}", exc_info=True)
+            err_str = str(e).lower()
+            if "resource" in err_str and "exhausted" in err_str or "429" in str(e) or "quota" in err_str:
+                tracker.on_error("API usage limit hit — please wait a few minutes.")
+            else:
+                tracker.on_error("I encountered an error processing your request.")
+
+        # --- Deliver final result ---
+        if tracker.phase == "error":
+            error_text = tracker.error_message or "I encountered an error processing your request."
+            if progress_msg:
+                try:
+                    await progress_msg.edit(content=error_text)
+                except Exception:
+                    await message.reply(error_text)
+            else:
+                await message.reply(error_text)
+            return ""
+
+        final_text = tracker.final_response
+        if not final_text:
+            # Stream ended without a final text response
+            final_text = "I wasn't able to generate a response. Please try again."
+
+        if progress_msg:
+            # Edit the progress message with the final response
+            chunks = self._chunk_text(final_text, max_size=DISCORD_MESSAGE_LIMIT)
+            try:
+                await progress_msg.edit(content=chunks[0])
+            except Exception:
+                # Progress message was deleted or inaccessible; fall back to new reply
+                await message.reply(chunks[0])
+            for chunk in chunks[1:]:
+                await message.channel.send(chunk)
+            return ""
+        else:
+            # No progress message was ever created (fast response, no tools)
+            return final_text
+
+    async def _stream_collect(self, inputs: dict, config: dict) -> str:
+        """Stream LangGraph execution, collecting only the final response.
+
+        Used by non-interactive callers (scheduled tasks, ingestion, etc.)
+        that don't need a Discord progress bar.
+        """
+        try:
+            final_text = ""
+            async for update in asyncio.wait_for(
+                graph_module.app_graph.astream(
+                    inputs, config=config, stream_mode="updates"
+                ),
+                timeout=LLM_TIMEOUT,
+            ):
+                if "agent" in update:
+                    agent_msgs = update["agent"].get("messages", [])
+                    if not agent_msgs:
+                        continue
+                    last_msg = agent_msgs[-1]
+                    tool_calls = getattr(last_msg, "tool_calls", None)
+                    if not tool_calls:
+                        final_text = self._extract_text(last_msg.content)
+
+            return final_text or "I wasn't able to generate a response. Please try again."
+        except asyncio.TimeoutError:
+            logger.error(f"LangGraph execution timed out after {LLM_TIMEOUT} seconds")
+            return "Sorry, that took too long — I wasn't able to get a response in time. Please try again in a moment."
+        except Exception as e:
+            logger.error(f"Error in LangGraph execution: {e}", exc_info=True)
+            err_str = str(e).lower()
+            if "resource" in err_str and "exhausted" in err_str or "429" in str(e) or "quota" in err_str:
+                return "I've hit my API usage limit — please wait a few minutes before sending another message. I'll be back shortly!"
+            return "I encountered an error processing your request."
+
+    async def process_llm_request(
+        self,
+        user_input: str,
+        channel_type: str,
+        thread_id: str = "",
+        images: list[dict] | None = None,
+        progress_message: "discord.Message | None" = None,
+    ) -> str:
         """
         Passes the user input into the LangGraph workflow with channel-specific context.
         Uses thread_id for conversation memory via the SqliteSaver checkpointer.
+
+        If progress_message is provided, shows a live progress bar in Discord
+        and edits it with the final response. Returns empty string in that case
+        (response was already posted). Otherwise returns the response text.
         """
         # Fold channel-specific guidance into the HumanMessage (not a separate
         # SystemMessage) to prevent old guidance from accumulating in checkpoint history.
@@ -1541,22 +1719,10 @@ class BeanBot(commands.Bot):
 
         config = {"configurable": {"thread_id": thread_id}} if thread_id else {}
 
-        try:
-            result = await asyncio.wait_for(
-                graph_module.app_graph.ainvoke(inputs, config=config),
-                timeout=LLM_TIMEOUT,
-            )
-            final_message = result["messages"][-1]
-            return self._extract_text(final_message.content)
-        except asyncio.TimeoutError:
-            logger.error(f"LangGraph execution timed out after {LLM_TIMEOUT} seconds")
-            return "Sorry, that took too long — I wasn't able to get a response in time. Please try again in a moment."
-        except Exception as e:
-            logger.error(f"Error in LangGraph execution: {e}", exc_info=True)
-            err_str = str(e).lower()
-            if "resource" in err_str and "exhausted" in err_str or "429" in str(e) or "quota" in err_str:
-                return "I've hit my API usage limit — please wait a few minutes before sending another message. I'll be back shortly!"
-            return "I encountered an error processing your request."
+        if progress_message is not None:
+            return await self._stream_with_progress(inputs, config, progress_message)
+        else:
+            return await self._stream_collect(inputs, config)
 
     @tasks.loop(time=BRIEFING_TIME)
     async def daily_report(self):
