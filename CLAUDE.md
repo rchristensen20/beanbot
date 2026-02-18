@@ -114,7 +114,7 @@ Why `uv sync --extra dev`: `bump-my-version` is a dev dependency. Plain `uv sync
 ## Things to Watch Out For
 
 - `tool_overwrite_file` replaces entire file contents — the agent uses this for tasks.md updates (checking boxes). If the agent hallucinates content, the file gets corrupted. The system prompt warns it to use caution.
-- The `trim_messages_for_context` function in `graph.py` keeps only the last 10 conversation turns to prevent context window overflow.
+- The `trim_messages_for_context` function in `graph.py` keeps only the last 4 conversation turns (configurable via `MAX_CONTEXT_TURNS` env var) to prevent context window overflow. Old messages are evicted from the checkpointed state via `RemoveMessage` so the SQLite DB doesn't grow unboundedly.
 - All file operations in `tools.py` use `os.path.basename()` to prevent directory traversal.
 - `SYSTEM_FILES` is defined once at the top of `tools.py` and used by `tool_delete_file` (prevents deletion), `_list_md_paths` (excludes from search/calendar/library listings), and `generate_calendar_from_library` (skips during scan).
 - `!consolidate` always backs up files before modifying/deleting. Backups live in `data/backups/`.

@@ -3,7 +3,7 @@ import os
 import logging
 from typing import List, TypedDict, Annotated
 from langgraph.graph.message import add_messages
-from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, RemoveMessage, SystemMessage, HumanMessage
 from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, END
@@ -198,7 +198,7 @@ class AgentState(TypedDict):
 # --- Node Logic ---
 
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0"))
-MAX_CONTEXT_TURNS = int(os.getenv("MAX_CONTEXT_TURNS", "10"))
+MAX_CONTEXT_TURNS = int(os.getenv("MAX_CONTEXT_TURNS", "4"))
 
 
 def get_model():
@@ -375,19 +375,32 @@ def _fix_tool_call_names(response: AIMessage) -> AIMessage:
 def agent_node(state: AgentState):
     """
     Standard agent node:
-    1. Trim accumulated history to last ~10 turns.
-    2. Prepend static instructions.
-    3. Invoke model.
-    4. Fix tool call names if Gemini dropped the 'tool_' prefix.
+    1. Trim accumulated history to last ~4 turns.
+    2. Evict old messages from checkpointed state via RemoveMessage.
+    3. Prepend static instructions.
+    4. Invoke model.
+    5. Fix tool call names if Gemini dropped the 'tool_' prefix.
     """
     model = get_model()
-    messages = trim_messages_for_context(state['messages'])
+    all_messages = state['messages']
+    messages = trim_messages_for_context(all_messages)
+
+    # Evict trimmed messages from the checkpointed state so the DB stops growing.
+    # Messages not in the trimmed window get RemoveMessage'd out of the state.
+    kept_ids = {id(m) for m in messages}
+    removals = [
+        RemoveMessage(id=m.id)
+        for m in all_messages
+        if id(m) not in kept_ids and getattr(m, "id", None)
+    ]
+    if removals:
+        logger.info(f"Evicting {len(removals)} old messages from checkpoint state")
 
     conversation = [SystemMessage(content=STATIC_SYSTEM_PROMPT)] + messages
 
     response = model.invoke(conversation)
     response = _fix_tool_call_names(response)
-    return {"messages": [response]}
+    return {"messages": removals + [response]}
 
 # --- Graph Construction ---
 
