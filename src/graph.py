@@ -12,18 +12,13 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 # Import our custom tool functions
 from src.services.tools import (
-    list_knowledge_files,
-    read_knowledge_file,
     update_journal,
     amend_topic_knowledge,
     add_task,
     log_harvest,
     overwrite_knowledge_file,
     generate_calendar_from_library,
-    get_current_date,
     complete_task,
-    find_related_files,
-    search_file_contents,
     read_multiple_files,
     backup_file,
     delete_knowledge_file,
@@ -32,6 +27,7 @@ from src.services.tools import (
     web_search,
     remove_tasks,
     reassign_tasks,
+    search_knowledge,
 )
 
 logger = logging.getLogger(__name__)
@@ -43,77 +39,17 @@ DB_PATH = os.path.join("data", "conversations.db")
 # --- Tool Wrappers for LangChain ---
 
 @tool
-def tool_list_files():
-    """Lists all available knowledge files in the data library."""
-    return list_knowledge_files()
+def tool_search_knowledge(query: str = ""):
+    """Discover files in the knowledge library. Use this FIRST before reading files.
+    - Empty query: lists all files.
+    - Non-empty: searches filenames AND file content, returns deduplicated results with match-type annotations.
+    Args: query (topic to search for, or empty string to list all files)"""
+    return search_knowledge(query)
 
 @tool
-def tool_read_file(filename: str):
-    """Reads a specific knowledge file. Args: filename (e.g. 'garlic.md')"""
-    return read_knowledge_file(filename)
-
-@tool
-def tool_update_journal(entry: str):
-    """Logs a general event to the daily garden log. Args: entry (text)"""
-    return update_journal(entry)
-
-@tool
-def tool_amend_knowledge(topic: str, content: str, source: str = ""):
-    """Appends knowledge to a topic file (creates if new, appends if exists). Before amending an existing file, always read it first with tool_read_file to check for contradictions. Args: topic (e.g. 'garlic'), content (text to append), source (provenance: URL, PDF filename, 'Discord message', or 'image')"""
-    logger.info(f"tool_amend_knowledge called: topic={topic!r}, content_len={len(content)}, source={source!r}")
-    result = amend_topic_knowledge(topic, content, source)
-    logger.info(f"tool_amend_knowledge result: {result}")
-    return result
-
-@tool
-def tool_add_task(task_description: str, due_date: str = "", assigned_to: str = "", skip_duplicate_check: bool = False, recurring: str = ""):
-    """Adds a task to the tracker. Checks for similar existing tasks first.
-    Args: task_description (text), due_date (YYYY-MM-DD, optional), assigned_to (name, optional),
-    skip_duplicate_check (set True to force-add even if similar tasks exist),
-    recurring (recurrence pattern, optional: daily, weekly, monthly, every N days, every N weeks — requires due_date)"""
-    return add_task(task_description, due_date, assigned_to, skip_duplicate_check, recurring)
-
-@tool
-def tool_log_harvest(crop: str, amount: str, location: str, notes: str = ""):
-    """Logs a harvest. Args: crop, amount, location, notes (optional)"""
-    return log_harvest(crop, amount, location, notes)
-
-@tool
-def tool_overwrite_file(filename: str, content: str):
-    """Replaces entire file content. Use for tasks.md checkbox updates, calendar rewrites, and farm_layout.md updates. Always read the file first to preserve existing data. Args: filename (e.g. 'tasks.md'), content (full new file content)"""
-    return overwrite_knowledge_file(filename, content)
-
-@tool
-def tool_generate_calendar():
-    """Scans the entire library to generate/update 'planting_calendar.md'. Use when asked to update the calendar."""
-    return generate_calendar_from_library()
-
-@tool
-def tool_get_date():
-    """Returns the current date and time."""
-    return get_current_date()
-
-@tool
-def tool_find_related_files(topic: str):
-    """Finds all files related to a topic/plant. Use this FIRST to discover all relevant data before reading. Args: topic (e.g. 'tomato', 'pepper')"""
-    return find_related_files(topic)
-
-@tool
-def tool_complete_task(task_snippet: str):
-    """Marks a task as complete (checks the box) in tasks.md and automatically logs to the journal. Do not also call tool_update_journal. Args: task_snippet (substring of task description to match)"""
-    return complete_task(task_snippet)
-
-@tool
-def tool_search_file_contents(query: str):
-    """Searches inside all knowledge files for mentions of a topic. Returns list of matching filenames. Args: query (e.g. 'garlic', 'companion planting')"""
-    results = search_file_contents(query)
-    if not results:
-        return f"No files contain mentions of '{query}'."
-    return "Files mentioning '{}': {}".format(query, ", ".join(results))
-
-@tool
-def tool_read_multiple_files(filenames: list[str]):
-    """Reads several knowledge files at once. More efficient than calling tool_read_file repeatedly. Args: filenames (list of filenames)"""
+def tool_read_files(filenames: list[str]):
+    """Reads one or more knowledge files. Pass a list with one or many filenames.
+    Args: filenames (list of filenames, e.g. ['garlic.md'] or ['garlic.md', 'tomatoes.md'])"""
     results = read_multiple_files(filenames)
     parts = []
     for filename, content in results.items():
@@ -121,18 +57,69 @@ def tool_read_multiple_files(filenames: list[str]):
     return "\n\n".join(parts)
 
 @tool
-def tool_backup_file(filename: str):
-    """Creates a backup of a file before modifying/deleting it. Copies to data/backups/ with timestamp. Args: filename (e.g. 'garlic.md')"""
-    return backup_file(filename)
+def tool_update_journal(entry: str):
+    """Logs a garden activity to the daily journal. Use for activities that do NOT match an existing task.
+    If the activity matches an open task, use tool_complete_task instead (it auto-logs).
+    Args: entry (text description of the activity)"""
+    return update_journal(entry)
+
+@tool
+def tool_amend_knowledge(topic: str, content: str, source: str = ""):
+    """Appends knowledge to a topic file (creates if new, appends if exists).
+    Before amending an existing file, read it first with tool_read_files to check for contradictions.
+    Args: topic (e.g. 'garlic'), content (text to append), source (provenance: URL, PDF filename, 'Discord message', or 'image')"""
+    logger.info(f"tool_amend_knowledge called: topic={topic!r}, content_len={len(content)}, source={source!r}")
+    result = amend_topic_knowledge(topic, content, source)
+    logger.info(f"tool_amend_knowledge result: {result}")
+    return result
+
+@tool
+def tool_add_task(task_description: str, due_date: str = "", assigned_to: str = "", skip_duplicate_check: bool = False, recurring: str = ""):
+    """Adds a task to the tracker. Checks for similar existing tasks first — if duplicates found, ask the user before forcing with skip_duplicate_check=True.
+    Args: task_description (text), due_date (YYYY-MM-DD, optional), assigned_to (name, optional),
+    skip_duplicate_check (set True to force-add even if similar tasks exist),
+    recurring (recurrence pattern, optional: daily, weekly, monthly, every N days, every N weeks — requires due_date)"""
+    return add_task(task_description, due_date, assigned_to, skip_duplicate_check, recurring)
+
+@tool
+def tool_log_harvest(crop: str, amount: str, location: str, notes: str = ""):
+    """Logs a harvest event. Args: crop, amount, location, notes (optional)"""
+    return log_harvest(crop, amount, location, notes)
+
+@tool
+def tool_overwrite_file(filename: str, content: str):
+    """Replaces entire file content. Use for tasks.md checkbox updates, calendar rewrites, and farm_layout.md updates.
+    Always read the file first to preserve existing data. Never use this to remove tasks — use tool_remove_tasks instead.
+    Args: filename (e.g. 'tasks.md'), content (full new file content)"""
+    return overwrite_knowledge_file(filename, content)
+
+@tool
+def tool_generate_calendar():
+    """Scans the entire knowledge library to generate/update 'planting_calendar.md'."""
+    return generate_calendar_from_library()
+
+@tool
+def tool_complete_task(task_snippet: str):
+    """Marks a task as complete (checks the box) AND automatically logs to the journal.
+    Do NOT also call tool_update_journal — completion already logs it.
+    Args: task_snippet (substring of task description to match)"""
+    return complete_task(task_snippet)
 
 @tool
 def tool_delete_file(filename: str):
-    """Deletes a knowledge file after merging. Cannot delete system files (tasks.md, harvests.md, etc). Args: filename (e.g. 'garlic_care.md')"""
-    return delete_knowledge_file(filename)
+    """Deletes a knowledge file. Automatically backs up to data/backups/ first.
+    Cannot delete system files (tasks.md, harvests.md, etc).
+    Args: filename (e.g. 'garlic_care.md')"""
+    backup_result = backup_file(filename)
+    if backup_result.startswith("Error"):
+        return backup_result
+    delete_result = delete_knowledge_file(filename)
+    return f"{backup_result}\n{delete_result}"
 
 @tool
 def tool_get_my_tasks(name: str):
-    """Returns open tasks assigned to a specific person plus all unassigned tasks. Tasks assigned to other people are excluded. Args: name (person's name)"""
+    """Returns open tasks assigned to a specific person plus all unassigned tasks. Tasks assigned to other people are excluded.
+    Args: name (person's name)"""
     tasks = get_tasks_for_user(name)
     if not tasks:
         return f"No open tasks for {name}."
@@ -148,8 +135,18 @@ def tool_list_members():
     return "Registered members:\n" + "\n".join(lines)
 
 @tool
+def tool_web_search(query: str, max_results: int = 5):
+    """Search the web for gardening information. Search the knowledge library first; only web-search
+    when local files lack the answer. Save useful results via tool_amend_knowledge with the URL as source.
+    Args: query (search terms), max_results (1-10, default 5)"""
+    return web_search(query, max_results)
+
+@tool
 def tool_remove_tasks(snippet: str):
-    """Permanently removes (deletes) all open tasks matching a substring. Unlike tool_complete_task which checks the box, this deletes the lines entirely. Use when the user wants tasks gone, not marked done. Args: snippet (case-insensitive text to match)"""
+    """Permanently removes (deletes) all open tasks matching a substring.
+    Unlike tool_complete_task which checks the box, this deletes the lines entirely.
+    Use when the user wants tasks gone, not marked done.
+    Args: snippet (case-insensitive text to match)"""
     return remove_tasks(snippet)
 
 @tool
@@ -160,28 +157,16 @@ def tool_reassign_tasks(from_name: str, to_name: str):
     Args: from_name (current assignee or 'unassigned'), to_name (new assignee)"""
     return reassign_tasks(from_name, to_name)
 
-@tool
-def tool_web_search(query: str, max_results: int = 5):
-    """Search the web using DuckDuckGo for gardening information not in the knowledge base.
-    Use this when the knowledge library doesn't have enough info to answer a question.
-    Returns titles, URLs, and snippets. Args: query (search terms), max_results (1-10, default 5)"""
-    return web_search(query, max_results)
-
 TOOLS = [
-    tool_list_files,
-    tool_read_file,
+    tool_search_knowledge,
+    tool_read_files,
     tool_update_journal,
     tool_amend_knowledge,
     tool_add_task,
     tool_log_harvest,
     tool_overwrite_file,
     tool_generate_calendar,
-    tool_get_date,
-    tool_find_related_files,
     tool_complete_task,
-    tool_search_file_contents,
-    tool_read_multiple_files,
-    tool_backup_file,
     tool_delete_file,
     tool_get_my_tasks,
     tool_list_members,
@@ -220,111 +205,56 @@ def get_model():
         temperature=LLM_TEMPERATURE,
     ).bind_tools(TOOLS)
 
-STATIC_SYSTEM_PROMPT = (
-    "You are Beanbot, a gardening assistant with access to a markdown knowledge library.\n"
-    "You must read files with tools to see their content. You have no memory of file contents.\n"
+_SYSTEM_PROMPT_TEMPLATE = (
+    "You are Beanbot, a gardening assistant with a markdown knowledge library.\n"
+    "Current date/time: {current_date}\n"
+    "You have no memory of file contents — always use tools to read them.\n"
     "\n"
-    "## Execution Model\n"
-    "Always call tools first, then respond with text. Every response follows this order:\n"
-    "1. Call all necessary tools (reading files, writing data, searching, completing tasks).\n"
-    "2. Check each tool's return value. If a tool returns an error, report the failure honestly.\n"
-    "3. Only after ALL tool work is finished, respond with a summary of what was accomplished.\n\n"
-    "Efficiency rule: prefer bulk tools over repeated single-item calls. For example, use "
-    "tool_reassign_tasks instead of reading and rewriting tasks.md for each task, or "
-    "tool_read_multiple_files instead of multiple tool_read_file calls. "
-    "When a request involves multiple items and no bulk tool exists, use tool_overwrite_file "
-    "to handle all changes in a single read-then-write pass rather than one item at a time.\n"
-    "If a request involves N items, handle all N before responding with text. "
-    "If too large to finish, complete as much as possible and list what remains.\n"
-    "When you lack specific plant care info, use tool_web_search to find concrete details. "
-    "Create actionable tasks with real numbers (e.g. 'Water weekly, 1 inch during growing season'), "
-    "not placeholder 'check care' or 'look up info' tasks. Finding information is your job.\n"
+    "## Rules\n"
+    "- Call all necessary tools before responding with text.\n"
+    "- Multi-item requests: process ALL items before writing any response text.\n"
+    "- When you lack plant care info, use tool_web_search to find specifics. "
+    "Create actionable tasks with real numbers, not 'check care' placeholders.\n"
     "\n"
     "## User Identity\n"
-    "The user's name appears as '[User: Name]' at the start of their message.\n"
-    "- 'My tasks' -> call tool_get_my_tasks with their name.\n"
-    "- Task assignment -> use the assigned_to param on tool_add_task. Leave empty when unspecified.\n"
+    "User's name appears as '[User: Name]' at the start of messages.\n"
+    "Use their name for tool_get_my_tasks and task assignment.\n"
     "\n"
-    "## Tool Routing\n"
+    "## Task Tools\n"
+    "- Add: tool_add_task — if duplicates found, ask user before forcing.\n"
+    "- Complete: tool_complete_task — checks box + auto-logs to journal. Do NOT also call tool_update_journal.\n"
+    "- Remove/delete: tool_remove_tasks — permanently deletes lines. Never use tool_overwrite_file for this.\n"
+    "- Reassign bulk: tool_reassign_tasks — moves tasks between people in one call.\n"
+    "- Recurring: use recurring param on tool_add_task (requires due_date). "
+    "Completed recurring tasks auto-reschedule — do not manually re-create.\n"
     "\n"
-    "### Answering Questions\n"
-    "1. Identify which files to read from the file lookup table below.\n"
-    "2. Use tool_find_related_files and tool_search_file_contents to discover additional relevant files.\n"
-    "3. Read files with tool_read_file or tool_read_multiple_files.\n"
-    "4. If the library lacks sufficient info, call tool_web_search with a specific query.\n"
-    "5. If web results contain generally useful info (care guides, planting dates, pest info), "
-    "also save it via tool_amend_knowledge with the result URL as the source arg.\n"
-    "6. Only web search when local files lack the answer. Skip for topics already well-covered.\n"
+    "## File Reference\n"
+    "- Layout/zones/beds: farm_layout.md\n"
+    "- Tasks: tasks.md\n"
+    "- Planting dates: planting_calendar.md\n"
+    "- Harvests: harvests.md\n"
+    "- Zone/frost: almanac.md\n"
+    "- Today's weather: daily_YYYY-MM-DD.md\n"
+    "- Activity log: garden_log.md\n"
+    "- Categories: categories.md\n"
+    "- Plant info: use tool_search_knowledge with plant name\n"
+    "- Sources: check ## Sources section in topic files\n"
     "\n"
-    "### User Reports Activity\n"
-    "1. Read tasks.md to check if the activity matches an open task.\n"
-    "2. If it matches: call tool_complete_task (auto-logs to journal; do not also call tool_update_journal).\n"
-    "3. If no match: call tool_update_journal.\n"
-    "\n"
-    "### Task Management\n"
-    "- Add tasks: tool_add_task. If it returns similar existing tasks, ask the user whether to add anyway, replace, or skip. "
-    "Use skip_duplicate_check=True only after user confirmation.\n"
-    "- Mark done: tool_complete_task (checks the box and logs to journal).\n"
-    "- Delete/remove tasks: tool_remove_tasks (permanently deletes lines). "
-    "Use this when user says 'remove' or 'delete', not tool_complete_task or tool_overwrite_file.\n"
-    "- Assign tasks: use the assigned_to parameter on tool_add_task.\n"
-    "- Reassign tasks in bulk: tool_reassign_tasks. Use this to move tasks between people "
-    "or assign all unassigned tasks — never read-and-rewrite tasks.md repeatedly.\n"
-    "- Recurring tasks: use the `recurring` param on tool_add_task for repeating tasks like watering, "
-    "feeding, fertilizing. Valid patterns: daily, weekly, monthly, every N days, every N weeks. "
-    "Recurring tasks REQUIRE a due_date. When a recurring task is completed, the next occurrence is "
-    "auto-created — do NOT manually re-create it.\n"
-    "\n"
-    "### File Lookup Table\n"
-    "- Inventory/layout/zone/location -> farm_layout.md (read first if zone is unknown)\n"
-    "- 'What is planted in [area]?' -> farm_layout.md, then tool_find_related_files for any "
-    "kit/collection names to get individual plant lists. List actual plants, not just kit names.\n"
-    "- Care/info for plants in [area] -> complete this entire sequence before responding:\n"
-    "  1. Read farm_layout.md, extract every plant name in that area.\n"
-    "  2. Call tool_find_related_files for each plant.\n"
-    "  3. Read all returned files with tool_read_multiple_files.\n"
-    "  4. For any plant where the knowledge base lacks care info, call tool_web_search.\n"
-    "  5. Save useful web results via tool_amend_knowledge with the URL as source.\n"
-    "  6. After all plants are processed, respond with care info for every plant.\n"
-    "- Plant details -> tool_find_related_files with plant name, then read relevant files\n"
-    "- Tasks/reminders -> tasks.md\n"
-    "- Planting schedule -> planting_calendar.md\n"
-    "- Harvest history -> harvests.md\n"
-    "- Zone/frost dates -> almanac.md\n"
-    "- Today's weather/briefing -> daily_YYYY-MM-DD.md (use today's date)\n"
-    "- Recent activity -> garden_log.md\n"
-    "- Categories/plant groups -> categories.md (summarize contents; do not list files from memory)\n"
-    "- 'Where did I learn this?' / sources for a topic -> read the topic file, check the '## Sources' section\n"
-    "- If unsure of filename -> call tool_list_files\n"
-    "\n"
-    "### Cross-Referencing\n"
-    "When giving planting advice or creating planting tasks:\n"
-    "- Read almanac.md for zone and frost dates.\n"
-    "- Read farm_layout.md for bed availability.\n"
-    "- Search for relevant technique files (companion planting, succession planting, soil amendment) "
-    "via tool_find_related_files.\n"
-    "- Include specific bed locations in planting tasks when possible.\n"
-    "\n"
-    "### Images\n"
-    "Users may send photos. You can see them directly.\n"
-    "- Garden layout photos: read farm_layout.md first, then update via tool_overwrite_file "
-    "merging new spatial info with existing content.\n"
-    "- Plant/pest photos: identify and respond conversationally.\n"
-    "- Area photos with captions: update the relevant section of farm_layout.md.\n"
+    "## Images\n"
+    "You can see photos directly. For garden layout photos, update farm_layout.md.\n"
     "\n"
     "## Response Format\n"
-    "\n"
-    "### Communication Style\n"
-    "Refer to stored information by topic name, not filename "
-    "(say 'the planting calendar' not 'planting_calendar.md'). Users cannot see raw files.\n"
-    "\n"
-    "### Discord Markdown\n"
-    "Responses render as Discord markdown. Ensure all formatting is well-formed:\n"
-    "- Every ** has a matching closing **. Every ` has a matching `.\n"
-    "- Blank line before bullet lists. Consistent indentation.\n"
-    "- Use ## and ### headers to organize long responses.\n"
-    "- Verify all formatting is closed before ending your message.\n"
+    "Refer to info by topic name, not filename. Format as Discord markdown.\n"
+    "Ensure all ** and ` formatting is properly closed.\n"
 )
+
+
+def _build_system_prompt() -> str:
+    """Build the system prompt with the current date injected."""
+    from datetime import datetime
+    return _SYSTEM_PROMPT_TEMPLATE.format(
+        current_date=datetime.now().strftime("%Y-%m-%d %H:%M:%S %Z"),
+    )
 
 
 def trim_messages_for_context(messages: List[BaseMessage], max_turns: int = MAX_CONTEXT_TURNS) -> List[BaseMessage]:
@@ -490,7 +420,7 @@ def agent_node(state: AgentState):
 
     messages = _summarize_old_turns(messages)
 
-    conversation = [SystemMessage(content=STATIC_SYSTEM_PROMPT)] + messages
+    conversation = [SystemMessage(content=_build_system_prompt())] + messages
 
     response = model.invoke(conversation)
     response = _fix_tool_call_names(response)

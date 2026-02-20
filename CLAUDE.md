@@ -110,11 +110,13 @@ Why `uv sync --extra dev`: `bump-my-version` is a dev dependency. Plain `uv sync
 1. Write the pure function in `src/services/tools.py`
 2. Create a `@tool`-decorated wrapper in `src/graph.py`
 3. Add it to the `TOOLS` list in `src/graph.py`
-4. Mention it in `STATIC_SYSTEM_PROMPT` so the agent knows when to use it
+4. Add routing hints to the tool's docstring (the system prompt is declarative; tool descriptions carry routing intelligence)
 
 ## Things to Watch Out For
 
-- `tool_overwrite_file` replaces entire file contents — the agent uses this for tasks.md updates (checking boxes). If the agent hallucinates content, the file gets corrupted. The system prompt warns it to use caution.
+- **Tool consolidation (v1.8.20)**: 20 tools → 15. `tool_search_knowledge` replaces `tool_list_files` + `tool_find_related_files` + `tool_search_file_contents`. `tool_read_files` replaces `tool_read_file` + `tool_read_multiple_files`. `tool_backup_file` removed (merged into `tool_delete_file` which auto-backs up). `tool_get_date` removed (date injected into system prompt via `_build_system_prompt()`). The underlying pure functions in `tools.py` still exist for direct use by `bot.py`.
+- **System prompt**: `_SYSTEM_PROMPT_TEMPLATE` is a declarative ~35-line prompt with a `{current_date}` placeholder. `_build_system_prompt()` formats it at invocation time. Routing intelligence lives in tool descriptions, not the system prompt.
+- `tool_overwrite_file` replaces entire file contents — the agent uses this for tasks.md updates (checking boxes). If the agent hallucinates content, the file gets corrupted. The tool description warns never to use it for task removal.
 - The `trim_messages_for_context` function in `graph.py` keeps only the last 4 conversation turns (configurable via `MAX_CONTEXT_TURNS` env var) to prevent context window overflow. Old messages are evicted from the checkpointed state via `RemoveMessage` so the SQLite DB doesn't grow unboundedly.
 - All file operations in `tools.py` use `os.path.basename()` to prevent directory traversal.
 - `SYSTEM_FILES` is defined once at the top of `tools.py` and used by `tool_delete_file` (prevents deletion), `_list_md_paths` (excludes from search/calendar/library listings), and `generate_calendar_from_library` (skips during scan).

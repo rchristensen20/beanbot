@@ -653,6 +653,45 @@ def search_file_contents(query: str) -> list[str]:
     return sorted(matches)
 
 
+def search_knowledge(query: str = "") -> str:
+    """Unified discovery: list files or search by filename and content.
+
+    - Empty query → lists all files (delegates to list_knowledge_files()).
+    - Non-empty → searches filenames AND content, returns deduplicated results
+      with match-type annotations.
+    """
+    if not query.strip():
+        return list_knowledge_files()
+
+    filename_matches = set()
+    safe_query = _sanitize_topic(query)
+    for f in _list_md_paths(exclude_system=False, exclude_daily=True):
+        basename = os.path.basename(f).lower()
+        if safe_query in basename:
+            filename_matches.add(os.path.basename(f))
+
+    content_matches = set(search_file_contents(query))
+
+    if not filename_matches and not content_matches:
+        return f"No files found related to '{query}'."
+
+    parts = []
+    # Files matching by name only
+    name_only = filename_matches - content_matches
+    if name_only:
+        parts.append("Filename matches: " + ", ".join(sorted(name_only)))
+    # Files matching both name and content
+    both = filename_matches & content_matches
+    if both:
+        parts.append("Filename + content matches: " + ", ".join(sorted(both)))
+    # Files matching by content only
+    content_only = content_matches - filename_matches
+    if content_only:
+        parts.append("Content matches: " + ", ".join(sorted(content_only)))
+
+    return "\n".join(parts)
+
+
 def read_multiple_files(filenames: list[str]) -> dict[str, str]:
     """
     Reads multiple files in one call.
