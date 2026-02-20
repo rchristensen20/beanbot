@@ -14,22 +14,26 @@ CATEGORIZE_MAX_TOKENS = int(os.getenv("CATEGORIZE_MAX_TOKENS", "16384"))
 
 
 def _extract_json(text: str) -> dict | list:
-    """Robustly extract JSON from LLM response text, handling markdown fences and preamble."""
+    """Robustly extract JSON (object or array) from LLM response text."""
     text = text.strip()
-    # Try to find JSON inside markdown code fences first
     fence_match = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
     if fence_match:
         text = fence_match.group(1).strip()
-    # Otherwise try to find the first { ... } block
-    elif not text.startswith("{"):
-        brace_start = text.find("{")
-        if brace_start != -1:
-            text = text[brace_start:]
-    # Trim trailing text after the last }
-    if not text.endswith("}"):
-        brace_end = text.rfind("}")
-        if brace_end != -1:
-            text = text[:brace_end + 1]
+    # Find earliest [ or {
+    arr_start = text.find("[")
+    obj_start = text.find("{")
+    if arr_start == -1 and obj_start == -1:
+        raise json.JSONDecodeError("No JSON found", text, 0)
+    if arr_start != -1 and (obj_start == -1 or arr_start < obj_start):
+        text = text[arr_start:]
+        end = text.rfind("]")
+        if end != -1:
+            text = text[:end + 1]
+    else:
+        text = text[obj_start:]
+        end = text.rfind("}")
+        if end != -1:
+            text = text[:end + 1]
     return json.loads(text)
 
 
@@ -170,32 +174,6 @@ def derive_merge_suggestions(categories: dict[str, dict[str, list[str]]]) -> lis
     return suggestions
 
 
-def _extract_json_array_or_object(text: str) -> dict | list:
-    """Extract JSON from LLM response, handling both arrays and objects."""
-    text = text.strip()
-    # Try to find JSON inside markdown code fences first
-    fence_match = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
-    if fence_match:
-        text = fence_match.group(1).strip()
-    # Find the first [ or {
-    arr_start = text.find("[")
-    obj_start = text.find("{")
-    if arr_start == -1 and obj_start == -1:
-        raise json.JSONDecodeError("No JSON found", text, 0)
-    # Use whichever comes first
-    if arr_start != -1 and (obj_start == -1 or arr_start < obj_start):
-        text = text[arr_start:]
-        brace_end = text.rfind("]")
-        if brace_end != -1:
-            text = text[:brace_end + 1]
-    else:
-        text = text[obj_start:]
-        brace_end = text.rfind("}")
-        if brace_end != -1:
-            text = text[:brace_end + 1]
-    return json.loads(text)
-
-
 async def analyze_duplicate_tasks(open_tasks: list[str]) -> list[dict]:
     """Analyze open tasks for duplicates and near-duplicates using an LLM.
 
@@ -248,7 +226,7 @@ async def analyze_duplicate_tasks(open_tasks: list[str]) -> list[dict]:
     text = response.content if isinstance(response.content, str) else str(response.content)
 
     try:
-        result = _extract_json_array_or_object(text)
+        result = _extract_json(text)
         if isinstance(result, dict):
             result = result.get("groups", result.get("duplicates", []))
         if not isinstance(result, list):

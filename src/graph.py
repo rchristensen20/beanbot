@@ -284,79 +284,56 @@ def trim_messages_for_context(messages: List[BaseMessage], max_turns: int = MAX_
     return leading_system + messages[cutoff_idx:]
 
 
-def _truncate_tool_message(msg: ToolMessage) -> ToolMessage:
-    """Truncate a bulky ToolMessage from a previous turn."""
-    content = msg.content
-    if not isinstance(content, str) or len(content) <= SUMMARIZE_THRESHOLD:
-        return msg
-    truncated = content[:SUMMARIZE_TOOL_LIMIT] + f"... [truncated from {len(content)} chars]"
-    return ToolMessage(
-        content=truncated,
-        tool_call_id=msg.tool_call_id,
-        name=getattr(msg, "name", None),
-        id=msg.id,
-        status=getattr(msg, "status", None),
-    )
+def _truncate_str(text: str, limit: int) -> str:
+    """Truncate a string past the threshold, appending a length note."""
+    if len(text) <= SUMMARIZE_THRESHOLD:
+        return text
+    return text[:limit] + f"... [truncated from {len(text)} chars]"
 
 
-def _truncate_human_message(msg: HumanMessage) -> HumanMessage:
-    """Truncate a bulky HumanMessage from a previous turn."""
-    content = msg.content
-    # Multipart content (list of dicts) — strip images, truncate text
-    if isinstance(content, list):
-        image_count = 0
-        new_parts = []
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "image_url":
-                image_count += 1
-                continue
-            if isinstance(part, dict) and part.get("type") == "text":
-                text = part.get("text", "")
-                if len(text) > SUMMARIZE_THRESHOLD:
-                    text = text[:SUMMARIZE_HUMAN_LIMIT] + f"... [truncated from {len(text)} chars]"
-                new_parts.append({"type": "text", "text": text})
-            else:
-                new_parts.append(part)
-        if image_count:
-            new_parts.append({"type": "text", "text": f"[{image_count} image(s) from earlier turn removed]"})
-        if new_parts == content:
+def _truncate_old_message(msg: BaseMessage) -> BaseMessage:
+    """Truncate a single message from a previous turn. AIMessages are never modified."""
+    if isinstance(msg, ToolMessage):
+        content = msg.content
+        if not isinstance(content, str) or len(content) <= SUMMARIZE_THRESHOLD:
             return msg
-        return HumanMessage(content=new_parts, id=msg.id)
-    # String content
-    if isinstance(content, str) and len(content) > SUMMARIZE_THRESHOLD:
-        truncated = content[:SUMMARIZE_HUMAN_LIMIT] + f"... [truncated from {len(content)} chars]"
-        return HumanMessage(content=truncated, id=msg.id)
+        return ToolMessage(
+            content=_truncate_str(content, SUMMARIZE_TOOL_LIMIT),
+            tool_call_id=msg.tool_call_id,
+            name=getattr(msg, "name", None),
+            id=msg.id,
+            status=getattr(msg, "status", None),
+        )
+    if isinstance(msg, HumanMessage):
+        content = msg.content
+        if isinstance(content, list):
+            image_count = 0
+            new_parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    image_count += 1
+                elif isinstance(part, dict) and part.get("type") == "text":
+                    new_parts.append({"type": "text", "text": _truncate_str(part.get("text", ""), SUMMARIZE_HUMAN_LIMIT)})
+                else:
+                    new_parts.append(part)
+            if image_count:
+                new_parts.append({"type": "text", "text": f"[{image_count} image(s) from earlier turn removed]"})
+            return msg if new_parts == content else HumanMessage(content=new_parts, id=msg.id)
+        if isinstance(content, str) and len(content) > SUMMARIZE_THRESHOLD:
+            return HumanMessage(content=_truncate_str(content, SUMMARIZE_HUMAN_LIMIT), id=msg.id)
     return msg
 
 
 def _summarize_old_turns(messages: list[BaseMessage]) -> list[BaseMessage]:
-    """Truncate bulky content in previous turns, keeping the current turn intact.
-
-    The current turn starts at the last HumanMessage. Everything before that
-    has ToolMessages and HumanMessages truncated. AIMessages are never modified
-    to preserve tool_calls structure.
-    """
-    # Find the last HumanMessage = start of current turn
-    last_human_idx = None
-    for i in range(len(messages) - 1, -1, -1):
-        if isinstance(messages[i], HumanMessage):
-            last_human_idx = i
-            break
-
+    """Truncate bulky ToolMessages and HumanMessages in previous turns.
+    The current turn (last HumanMessage onward) is kept intact."""
+    last_human_idx = next(
+        (i for i in range(len(messages) - 1, -1, -1) if isinstance(messages[i], HumanMessage)),
+        None,
+    )
     if last_human_idx is None or last_human_idx == 0:
         return messages
-
-    result = []
-    for i, msg in enumerate(messages):
-        if i >= last_human_idx:
-            result.append(msg)
-        elif isinstance(msg, ToolMessage):
-            result.append(_truncate_tool_message(msg))
-        elif isinstance(msg, HumanMessage):
-            result.append(_truncate_human_message(msg))
-        else:
-            result.append(msg)
-    return result
+    return [_truncate_old_message(m) if i < last_human_idx else m for i, m in enumerate(messages)]
 
 
 def _fix_tool_call_names(response: AIMessage) -> AIMessage:

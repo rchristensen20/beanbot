@@ -18,7 +18,7 @@ BOT_TZ = ZoneInfo(os.getenv("BOT_TIMEZONE", "America/Denver"))
 from src.graph import init_graph
 import src.graph as graph_module
 # Import basic file reader for the daily report
-from src.services.tools import read_knowledge_file, get_open_tasks, find_related_files, search_file_contents, build_library_index, get_library_files, is_onboarding_complete, register_member, get_member_name_by_discord_id, list_members, get_tasks_for_user, get_clearable_knowledge_files, clear_all_knowledge_files, clear_entire_garden, delete_knowledge_file, complete_task, filter_tasks_due_today_or_overdue, backup_file, overwrite_knowledge_file, _sanitize_topic, SYSTEM_FILES, DATA_DIR
+from src.services.tools import read_knowledge_file, get_open_tasks, find_related_files, search_file_contents, get_library_files, is_onboarding_complete, register_member, get_member_name_by_discord_id, list_members, get_tasks_for_user, get_clearable_knowledge_files, clear_all_knowledge_files, clear_entire_garden, delete_knowledge_file, complete_task, filter_tasks_due_today_or_overdue, backup_file, overwrite_knowledge_file, _sanitize_topic, SYSTEM_FILES, DATA_DIR
 from src.services.categorization import categorize_files, derive_merge_suggestions, analyze_duplicate_tasks
 from src.services.weather import fetch_current_weather, fetch_forecast
 from src.services.progress import ProgressTracker
@@ -113,63 +113,32 @@ def _extract_task_description_numbered(num: int, desc: str) -> str:
 
 
 CHANNEL_CONTEXT = {
-    "journal": "[CONTEXT: User is posting in the JOURNAL channel. Prioritize logging updates and amending knowledge.]\n\n",
-    "questions": "[CONTEXT: User is posting in the QUESTIONS channel. You MUST use tools to retrieve info before answering.]\n\n",
+    "journal": "[CONTEXT: JOURNAL channel. Prioritize logging updates and amending knowledge.]\n\n",
+    "questions": "[CONTEXT: QUESTIONS channel. Use tools to retrieve info before answering.]\n\n",
     "knowledge_ingest": (
-        "[CONTEXT: User is posting content to INGEST into the knowledge library.\n"
-        "Your job:\n"
-        "1. Identify all gardening/permaculture topics mentioned (plant names, techniques, etc.)\n"
-        "2. For EACH topic, use the BROADEST/SIMPLEST topic name — prefer 'garlic' over 'garlic_growing_tips', "
-        "'tomato' over 'cherry_tomato_care'. This keeps related info in one file instead of fragmenting.\n"
-        "3. Call tool_amend_knowledge with the topic name, relevant facts, AND the 'source' arg.\n"
-        "   - Parse the source from the '--- Content from <source> ---' header if present.\n"
-        "   - For plain text with no header, use source='Discord message'.\n"
-        "   - For images, use source='image'.\n"
-        "4. Before amending a topic that already has a file, READ it first with tool_read_files.\n"
-        "   If the new info contradicts existing facts, include a conflict note in the content:\n"
-        "   > **Conflict:** Previous entry says X, but this source says Y. Verify for your zone.\n"
-        "5. Be thorough - extract cultivar info, planting dates, care tips, companion plants, etc.\n"
-        "5a. GARDEN KITS / PLANT COLLECTIONS: When the content describes a garden kit or plant collection, "
-        "create a knowledge file for the kit itself (e.g. 'colorado_oasis_garden_kit') that lists ALL "
-        "individual plants with quantities, species names, and any care info provided. ALSO create or amend "
-        "individual knowledge files for each plant in the kit if meaningful care info is available.\n"
-        "5b. LOCATION CROSS-REFERENCING: When the user mentions where something is planted "
-        "(e.g. 'I planted this in the front yard'), update farm_layout.md to include not just the kit name "
-        "but also list the individual plants contained in it. The layout file should be self-contained enough "
-        "that someone reading it can see the actual plants in each area without having to look up kit files.\n"
-        "6. When extracting planting dates, use headers like '**Spring Planting Dates:**' and "
-        "'**Fall Planting Dates:**' so the planting calendar generator can parse them.\n"
-        "7. Reply with a short confirmation (under 500 chars): list the TOPICS updated by name "
-        "(e.g. 'Garlic, Tomato, Companion Planting') and a one-line summary. "
-        "Do NOT reference filenames or repeat the ingested content.\n"
-        "8. On the very last line of your reply, write exactly: TOPICS: topic1, topic2, topic3 "
-        "(matching the topic names you passed to tool_amend_knowledge). This line is parsed by the system.]\n\n"
+        "[CONTEXT: KNOWLEDGE INGEST — extract and store all gardening topics from this content.\n"
+        "1. Use broadest topic names ('garlic' not 'garlic_growing_tips') to avoid fragmentation.\n"
+        "2. Call tool_amend_knowledge per topic with source arg (parse from '--- Content from <source> ---' header, "
+        "or 'Discord message' / 'image' as appropriate).\n"
+        "3. Read existing files first via tool_read_files. Flag contradictions with "
+        "> **Conflict:** blockquotes.\n"
+        "4. Extract thoroughly: cultivars, planting dates, care, companions, pests.\n"
+        "5. Garden kits: create a kit file listing all plants + individual plant files.\n"
+        "6. Location mentions: update farm_layout.md with individual plant names (not just kit names).\n"
+        "7. Use '**Spring Planting Dates:**' / '**Fall Planting Dates:**' headers for calendar parsing.\n"
+        "8. Reply under 500 chars: list topic names updated + one-line summary.\n"
+        "9. Last line of reply: TOPICS: topic1, topic2, topic3 (parsed by the system).]\n\n"
     ),
     "onboarding": (
-        "[CONTEXT: This is a NEW USER ONBOARDING session via DM. Guide them through setup step by step.\n"
-        "Be warm, conversational, and ask ONE topic at a time. Wait for their response before moving on.\n\n"
-        "PHASE 1 — Location & Zone:\n"
-        "- Ask for their city/state or general area\n"
-        "- Determine their USDA hardiness zone and estimated frost dates from the location\n"
-        "- Create 'almanac.md' via tool_overwrite_file with: zone, last/first frost dates, growing season length, and climate notes\n"
-        "- Do NOT create almanac.md until the user confirms their location\n\n"
-        "PHASE 2 — Garden Layout:\n"
-        "- Ask about their garden setup (raised beds, in-ground rows, containers, greenhouse, etc.)\n"
-        "- Create 'farm_layout.md' via tool_overwrite_file from their description\n"
-        "- Let them know they can draw/sketch their garden layout, label it, and upload the photo — the bot will extract spatial info and update farm_layout.md automatically\n\n"
-        "PHASE 3 — Knowledge Building (user-driven, NOT LLM-generated):\n"
-        "- Do NOT generate plant information from your own knowledge\n"
-        "- Explain the knowledge-ingest channel and what they can upload:\n"
-        "  * URLs/articles — paste links to growing guides, extension service pages, seed company info\n"
-        "  * PDFs — upload seed catalogs, planting guides, soil reports\n"
-        "  * Photos — upload garden photos for plant/pest identification, or layout sketches\n"
-        "  * Text — paste notes, tips, or information directly\n"
-        "- Explain that the more they feed it, the smarter the daily briefings and advice become\n\n"
-        "PHASE 4 — Orient to channels & commands:\n"
-        "- Explain each channel: journal (daily updates), questions (Q&A), reminders (briefings/alerts), knowledge-ingest (feed info)\n"
-        "- Mention key commands: !briefing, !debrief, !recap, !consolidate\n"
-        "- Let them know they can always ask questions or add more info anytime\n"
-        "- Welcome them warmly and let them know setup is complete!]\n\n"
+        "[CONTEXT: NEW USER ONBOARDING via DM. Be warm, ask ONE question at a time.\n"
+        "Phase 1 — Location: Ask city/state, determine USDA zone + frost dates, "
+        "create almanac.md (only after user confirms).\n"
+        "Phase 2 — Layout: Ask about garden setup, create farm_layout.md. "
+        "Mention they can upload a sketch/photo.\n"
+        "Phase 3 — Knowledge: Explain the knowledge-ingest channel accepts URLs, PDFs, photos, text. "
+        "Do NOT generate plant info yourself.\n"
+        "Phase 4 — Orient: Explain channels (journal, questions, reminders, knowledge-ingest) "
+        "and commands (!briefing, !debrief, !recap, !consolidate). Welcome them!]\n\n"
     ),
 }
 
@@ -1029,6 +998,29 @@ class BeanBot(commands.Bot):
         else:
             await self._clear_topic(ctx, topic)
 
+    async def _confirm_chain(self, ctx, steps: list[tuple[str, str]], final_action):
+        """Generic multi-step confirmation. Each step = (button_label, message_text).
+        final_action is an async callback(interaction) called when the last step is confirmed."""
+        author_id = ctx.author.id
+
+        def _make_callback(remaining_steps, final_action):
+            async def callback(interaction: discord.Interaction):
+                if not remaining_steps:
+                    await final_action(interaction)
+                    return
+                label, text = remaining_steps[0]
+                next_cb = _make_callback(remaining_steps[1:], final_action)
+                view = ConfirmView(label, next_cb, author_id)
+                await interaction.response.edit_message(content=text, view=view)
+                view.message = interaction.message
+            return callback
+
+        first_label, first_text = steps[0]
+        first_cb = _make_callback(steps[1:], final_action)
+        view1 = ConfirmView(first_label, first_cb, author_id)
+        msg = await ctx.send(first_text, view=view1)
+        view1.message = msg
+
     async def _clear_topic(self, ctx, topic: str):
         """Delete a single knowledge file with 2-step confirmation."""
         safe = _sanitize_topic(topic)
@@ -1043,29 +1035,16 @@ class BeanBot(commands.Bot):
             await ctx.send(f"File `{filename}` not found.")
             return
 
-        size = os.path.getsize(filepath)
-        size_str = self._format_size(size)
+        size_str = self._format_size(os.path.getsize(filepath))
 
-        # Step 1
-        async def step2(interaction: discord.Interaction):
-            view2 = ConfirmView(f"Delete {filename}", final_confirm, ctx.author.id)
-            await interaction.response.edit_message(
-                content=f"**Are you sure?** This will permanently delete `{filename}` ({size_str}). This cannot be undone.",
-                view=view2,
-            )
-            view2.message = interaction.message
-
-        # Step 2 (final)
-        async def final_confirm(interaction: discord.Interaction):
-            result = delete_knowledge_file(filename)
+        async def do_delete(interaction):
+            delete_knowledge_file(filename)
             await interaction.response.edit_message(content=f"Deleted `{filename}`.", view=None)
 
-        view1 = ConfirmView("Continue", step2, ctx.author.id)
-        msg = await ctx.send(
-            f"**Clear file:** `{filename}` ({size_str})\n\nThis will permanently delete this knowledge file.",
-            view=view1,
-        )
-        view1.message = msg
+        await self._confirm_chain(ctx, [
+            ("Continue", f"**Clear file:** `{filename}` ({size_str})\n\nThis will permanently delete this knowledge file."),
+            (f"Delete {filename}", f"**Are you sure?** This will permanently delete `{filename}` ({size_str}). This cannot be undone."),
+        ], do_delete)
 
     async def _clear_knowledge(self, ctx):
         """Delete all non-system knowledge files with 3-step confirmation."""
@@ -1079,47 +1058,21 @@ class BeanBot(commands.Bot):
         if count > 20:
             file_list += f" ... and {count - 20} more"
 
-        # Step 1
-        async def step2(interaction: discord.Interaction):
-            view2 = ConfirmView("Continue", step3, ctx.author.id)
-            await interaction.response.edit_message(
-                content=(
-                    f"**Second confirmation.** You are about to delete **{count}** knowledge files.\n\n"
-                    f"System files (tasks, harvests, almanac, etc.) will NOT be touched.\n"
-                    f"This cannot be undone."
-                ),
-                view=view2,
-            )
-            view2.message = interaction.message
-
-        # Step 2
-        async def step3(interaction: discord.Interaction):
-            view3 = ConfirmView(f"Delete all {count} files", final_confirm, ctx.author.id)
-            await interaction.response.edit_message(
-                content=f"**Final confirmation.** Click below to permanently delete all {count} knowledge files.",
-                view=view3,
-            )
-            view3.message = interaction.message
-
-        # Step 3 (final)
-        async def final_confirm(interaction: discord.Interaction):
+        async def do_delete(interaction):
             deleted, errors = clear_all_knowledge_files()
             summary = f"Deleted **{len(deleted)}** knowledge file(s)."
             if errors:
                 summary += f"\n\nErrors ({len(errors)}):\n" + "\n".join(f"- {e}" for e in errors)
             await interaction.response.edit_message(content=summary, view=None)
 
-        view1 = ConfirmView("I understand, continue", step2, ctx.author.id)
-        msg = await ctx.send(
-            f"**Clear knowledge library** — this will delete **{count}** file(s):\n{file_list}\n\n"
-            f"System files will be preserved.",
-            view=view1,
-        )
-        view1.message = msg
+        await self._confirm_chain(ctx, [
+            ("I understand, continue", f"**Clear knowledge library** — this will delete **{count}** file(s):\n{file_list}\n\nSystem files will be preserved."),
+            ("Continue", f"**Second confirmation.** You are about to delete **{count}** knowledge files.\n\nSystem files (tasks, harvests, almanac, etc.) will NOT be touched.\nThis cannot be undone."),
+            (f"Delete all {count} files", f"**Final confirmation.** Click below to permanently delete all {count} knowledge files."),
+        ], do_delete)
 
     async def _clear_garden(self, ctx):
         """Factory reset with 3-step confirmation."""
-        # Inventory what will be deleted
         knowledge_files = get_clearable_knowledge_files()
         system_files = [f for f in os.listdir(DATA_DIR) if f in SYSTEM_FILES and os.path.isfile(os.path.join(DATA_DIR, f))]
         other_files = [
@@ -1127,43 +1080,6 @@ class BeanBot(commands.Bot):
             if os.path.isfile(os.path.join(DATA_DIR, f)) and f not in SYSTEM_FILES and f not in knowledge_files
         ]
         dirs = [d for d in os.listdir(DATA_DIR) if os.path.isdir(os.path.join(DATA_DIR, d))]
-
-        # Step 1
-        async def step2(interaction: discord.Interaction):
-            view2 = ConfirmView("Continue", step3, ctx.author.id)
-            await interaction.response.edit_message(
-                content=(
-                    "**This will delete EVERYTHING in data/:**\n"
-                    "- All knowledge files\n"
-                    "- System files (tasks, harvests, almanac, garden log, etc.)\n"
-                    "- Conversation memory (conversations.db)\n"
-                    "- Member registry (members.json)\n"
-                    "- All backups\n"
-                    "- Weather alert flags\n\n"
-                    "**Nothing will be recoverable.**"
-                ),
-                view=view2,
-            )
-            view2.message = interaction.message
-
-        # Step 2
-        async def step3(interaction: discord.Interaction):
-            view3 = ConfirmView("Reset everything", final_confirm, ctx.author.id)
-            await interaction.response.edit_message(
-                content="**POINT OF NO RETURN.** Click below to factory-reset your entire garden.",
-                view=view3,
-            )
-            view3.message = interaction.message
-
-        # Step 3 (final)
-        async def final_confirm(interaction: discord.Interaction):
-            result = clear_entire_garden()
-            n_files = len(result["deleted_files"])
-            n_dirs = len(result["deleted_dirs"])
-            summary = f"Factory reset complete. Deleted **{n_files}** file(s) and **{n_dirs}** directory/directories."
-            if result["errors"]:
-                summary += f"\n\nErrors ({len(result['errors'])}):\n" + "\n".join(f"- {e}" for e in result["errors"])
-            await interaction.response.edit_message(content=summary, view=None)
 
         inventory_lines = []
         if knowledge_files:
@@ -1174,16 +1090,22 @@ class BeanBot(commands.Bot):
             inventory_lines.append(f"- **{len(other_files)}** other files ({', '.join(other_files[:5])}{'...' if len(other_files) > 5 else ''})")
         if dirs:
             inventory_lines.append(f"- **{len(dirs)}** directories ({', '.join(dirs)})")
-
         inventory = "\n".join(inventory_lines) if inventory_lines else "- (data/ is empty)"
 
-        view1 = ConfirmView("I understand", step2, ctx.author.id)
-        msg = await ctx.send(
-            f"**Factory reset** — this will delete everything in `data/`:\n{inventory}\n\n"
-            f"This is irreversible. All knowledge, tasks, logs, conversations, and backups will be gone.",
-            view=view1,
-        )
-        view1.message = msg
+        async def do_reset(interaction):
+            result = clear_entire_garden()
+            n_files = len(result["deleted_files"])
+            n_dirs = len(result["deleted_dirs"])
+            summary = f"Factory reset complete. Deleted **{n_files}** file(s) and **{n_dirs}** directory/directories."
+            if result["errors"]:
+                summary += f"\n\nErrors ({len(result['errors'])}):\n" + "\n".join(f"- {e}" for e in result["errors"])
+            await interaction.response.edit_message(content=summary, view=None)
+
+        await self._confirm_chain(ctx, [
+            ("I understand", f"**Factory reset** — this will delete everything in `data/`:\n{inventory}\n\nThis is irreversible. All knowledge, tasks, logs, conversations, and backups will be gone."),
+            ("Continue", "**This will delete EVERYTHING in data/:**\n- All knowledge files\n- System files (tasks, harvests, almanac, garden log, etc.)\n- Conversation memory (conversations.db)\n- Member registry (members.json)\n- All backups\n- Weather alert flags\n\n**Nothing will be recoverable.**"),
+            ("Reset everything", "**POINT OF NO RETURN.** Click below to factory-reset your entire garden."),
+        ], do_reset)
 
     def _inject_mentions(self, text: str) -> str:
         """Replace registered member names with Discord @mentions in text."""

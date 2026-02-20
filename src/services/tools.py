@@ -124,17 +124,6 @@ def register_member(name: str, discord_id: int) -> str:
     return f"Registered '{name}' (ID: {discord_id})."
 
 
-def unregister_member(name: str) -> str:
-    """Removes a name from the member registry."""
-    members = _load_members()
-    key = name.strip().lower()
-    if key not in members:
-        return f"'{name}' is not registered."
-    del members[key]
-    _save_members(members)
-    return f"Unregistered '{name}'."
-
-
 def get_member_discord_id(name: str) -> int | None:
     """Lookup discord_id by name."""
     return _load_members().get(name.strip().lower())
@@ -604,13 +593,6 @@ def filter_tasks_due_today_or_overdue(tasks: list[str], today_str: str) -> list[
     return result
 
 
-def get_current_date() -> str:
-    """
-    Returns the current date and time.
-    """
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S %Z")
-
-
 def web_search(query: str, max_results: int = 5) -> str:
     """Search the web via DuckDuckGo and return formatted results."""
     max_results = max(1, min(10, max_results))
@@ -783,31 +765,6 @@ def get_library_files() -> list[dict]:
     return entries
 
 
-def build_library_index() -> list[dict]:
-    """
-    Scans all knowledge files (excluding system files, daily_* files).
-    Returns list of grouped dicts with {topic, files} using prefix-based grouping.
-    """
-    entries = get_library_files()
-
-    # Group by shared filename prefix (stem before first underscore or full stem)
-    from collections import defaultdict
-    groups = defaultdict(list)
-    for entry in entries:
-        stem = entry["filename"].replace(".md", "")
-        prefix = stem.split("_")[0] if "_" in stem else stem
-        groups[prefix].append(entry)
-
-    # Only return groups with 2+ files
-    grouped = []
-    for prefix, group_entries in sorted(groups.items()):
-        if len(group_entries) >= 2:
-            grouped.append({
-                "topic": prefix,
-                "files": sorted(group_entries, key=lambda e: e["filename"]),
-            })
-
-    return grouped
 
 def get_clearable_knowledge_files() -> list[str]:
     """Returns filenames of all non-system, non-daily .md files that can be cleared."""
