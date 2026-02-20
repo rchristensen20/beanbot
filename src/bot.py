@@ -35,6 +35,7 @@ MAX_INGEST_URLS = int(os.getenv("MAX_INGEST_URLS", "5"))
 MAX_RECAP_DAYS = int(os.getenv("MAX_RECAP_DAYS", "90"))
 MAX_CRAWL_LINKS = int(os.getenv("MAX_CRAWL_LINKS", "50"))
 CRAWL_CONCURRENCY = int(os.getenv("CRAWL_CONCURRENCY", "5"))
+GRAPH_RECURSION_LIMIT = int(os.getenv("GRAPH_RECURSION_LIMIT", "40"))
 
 # Schedule times (HH:MM in 24h format)
 _briefing_h, _briefing_m = os.getenv("BRIEFING_TIME", "08:00").split(":")
@@ -1729,7 +1730,7 @@ class BeanBot(commands.Bot):
         else:
             inputs = {"messages": [HumanMessage(content=guidance + user_input)]}
 
-        config = {"configurable": {"thread_id": thread_id}} if thread_id else {}
+        config = {"configurable": {"thread_id": thread_id}, "recursion_limit": GRAPH_RECURSION_LIMIT} if thread_id else {"recursion_limit": GRAPH_RECURSION_LIMIT}
 
         if progress_message is not None:
             return await self._stream_with_progress(inputs, config, progress_message)
@@ -1832,7 +1833,7 @@ class BeanBot(commands.Bot):
 
         inputs = {"messages": [HumanMessage(content=prompt)]}
         ephemeral_thread_id = f"daily_report_{today}"
-        config = {"configurable": {"thread_id": ephemeral_thread_id}}
+        config = {"configurable": {"thread_id": ephemeral_thread_id}, "recursion_limit": GRAPH_RECURSION_LIMIT}
         try:
             result = await asyncio.wait_for(
                 graph_module.app_graph.ainvoke(inputs, config=config),

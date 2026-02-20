@@ -824,6 +824,79 @@ def clear_entire_garden() -> dict:
     return {"deleted_files": deleted_files, "deleted_dirs": deleted_dirs, "errors": errors}
 
 
+def reassign_tasks(from_name: str, to_name: str) -> str:
+    """Reassign all open tasks from one person to another (or assign unassigned tasks) in bulk.
+
+    Args:
+        from_name: Current assignee name, or "unassigned" to match tasks with no [Assigned:] tag.
+        to_name: New assignee name.
+    """
+    filename = "tasks.md"
+    path = os.path.join(DATA_DIR, filename)
+
+    if not os.path.exists(path):
+        return "Task list file does not exist."
+
+    try:
+        with open(path, "r") as f:
+            lines = f.readlines()
+
+        new_lines = []
+        reassigned = []
+        assigned_re = re.compile(r'\[Assigned:\s*([^\]]+)\]', re.IGNORECASE)
+        is_unassigned = from_name.strip().lower() in ("", "unassigned")
+
+        for line in lines:
+            if "- [ ]" not in line:
+                new_lines.append(line)
+                continue
+
+            match = assigned_re.search(line)
+
+            if is_unassigned:
+                # Match open tasks with no [Assigned:] tag
+                if match:
+                    new_lines.append(line)
+                    continue
+                # Insert [Assigned: to_name] after the description, before other metadata
+                # Find the first metadata tag position
+                desc_end = len(line.rstrip("\n"))
+                for tag_re in [r'\[Recurring:', r'\[Due:', r'\(Created:']:
+                    tag_match = re.search(tag_re, line)
+                    if tag_match and tag_match.start() < desc_end:
+                        desc_end = tag_match.start()
+                new_line = line[:desc_end].rstrip() + f" [Assigned: {to_name.strip()}]" + line[desc_end:]
+                new_lines.append(new_line)
+                # Extract description for summary
+                desc = re.sub(r'^- \[[ x]\] ', '', line.strip())
+                desc = re.sub(r'\s*\[.*?\]|\s*\(Created:.*?\)', '', desc).strip()
+                reassigned.append(desc)
+            elif match and match.group(1).strip().lower() == from_name.strip().lower():
+                # Replace existing assignment
+                new_line = line[:match.start()] + f"[Assigned: {to_name.strip()}]" + line[match.end():]
+                new_lines.append(new_line)
+                desc = re.sub(r'^- \[[ x]\] ', '', line.strip())
+                desc = re.sub(r'\s*\[.*?\]|\s*\(Created:.*?\)', '', desc).strip()
+                reassigned.append(desc)
+            else:
+                new_lines.append(line)
+
+        if not reassigned:
+            source = "unassigned tasks" if is_unassigned else f"tasks assigned to '{from_name}'"
+            return f"No open {source} found."
+
+        with open(path, "w") as f:
+            f.writelines(new_lines)
+
+        source = "unassigned" if is_unassigned else from_name.strip()
+        summary = f"Reassigned {len(reassigned)} task(s) from {source} to {to_name.strip()}:\n"
+        summary += "\n".join(f"- {desc}" for desc in reassigned)
+        return summary
+    except Exception as e:
+        logger.error(f"Failed to reassign tasks: {e}")
+        return f"Error reassigning tasks: {str(e)}"
+
+
 def remove_tasks(snippet: str) -> str:
     """Remove (permanently delete) all open tasks whose description matches a substring.
 

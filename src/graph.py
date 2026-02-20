@@ -31,6 +31,7 @@ from src.services.tools import (
     get_tasks_for_user,
     web_search,
     remove_tasks,
+    reassign_tasks,
 )
 
 logger = logging.getLogger(__name__)
@@ -152,6 +153,14 @@ def tool_remove_tasks(snippet: str):
     return remove_tasks(snippet)
 
 @tool
+def tool_reassign_tasks(from_name: str, to_name: str):
+    """Reassigns all open tasks from one person to another in a single bulk operation.
+    Use instead of reading and rewriting tasks.md for each task individually.
+    Set from_name to 'unassigned' to assign all unassigned tasks.
+    Args: from_name (current assignee or 'unassigned'), to_name (new assignee)"""
+    return reassign_tasks(from_name, to_name)
+
+@tool
 def tool_web_search(query: str, max_results: int = 5):
     """Search the web using DuckDuckGo for gardening information not in the knowledge base.
     Use this when the knowledge library doesn't have enough info to answer a question.
@@ -178,6 +187,7 @@ TOOLS = [
     tool_list_members,
     tool_web_search,
     tool_remove_tasks,
+    tool_reassign_tasks,
 ]
 
 # Build a lookup to fix tool names when Gemini drops the "tool_" prefix.
@@ -219,11 +229,13 @@ STATIC_SYSTEM_PROMPT = (
     "1. Call all necessary tools (reading files, writing data, searching, completing tasks).\n"
     "2. Check each tool's return value. If a tool returns an error, report the failure honestly.\n"
     "3. Only after ALL tool work is finished, respond with a summary of what was accomplished.\n\n"
-    "Multi-item rule: if a request involves N items (e.g. 8 plants, 5 tasks), you must call tools "
-    "for all N items before responding with any text. Do not respond after processing some items — "
-    "keep calling tools until every item is handled, then write your response.\n"
-    "If a request is too large to finish, complete as much as possible and list exactly what remains "
-    "for the user to request next.\n"
+    "Efficiency rule: prefer bulk tools over repeated single-item calls. For example, use "
+    "tool_reassign_tasks instead of reading and rewriting tasks.md for each task, or "
+    "tool_read_multiple_files instead of multiple tool_read_file calls. "
+    "When a request involves multiple items and no bulk tool exists, use tool_overwrite_file "
+    "to handle all changes in a single read-then-write pass rather than one item at a time.\n"
+    "If a request involves N items, handle all N before responding with text. "
+    "If too large to finish, complete as much as possible and list what remains.\n"
     "When you lack specific plant care info, use tool_web_search to find concrete details. "
     "Create actionable tasks with real numbers (e.g. 'Water weekly, 1 inch during growing season'), "
     "not placeholder 'check care' or 'look up info' tasks. Finding information is your job.\n"
@@ -256,6 +268,8 @@ STATIC_SYSTEM_PROMPT = (
     "- Delete/remove tasks: tool_remove_tasks (permanently deletes lines). "
     "Use this when user says 'remove' or 'delete', not tool_complete_task or tool_overwrite_file.\n"
     "- Assign tasks: use the assigned_to parameter on tool_add_task.\n"
+    "- Reassign tasks in bulk: tool_reassign_tasks. Use this to move tasks between people "
+    "or assign all unassigned tasks — never read-and-rewrite tasks.md repeatedly.\n"
     "- Recurring tasks: use the `recurring` param on tool_add_task for repeating tasks like watering, "
     "feeding, fertilizing. Valid patterns: daily, weekly, monthly, every N days, every N weeks. "
     "Recurring tasks REQUIRE a due_date. When a recurring task is completed, the next occurrence is "
