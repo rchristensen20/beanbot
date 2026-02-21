@@ -949,69 +949,58 @@ def complete_task(task_snippet: str) -> str:
     try:
         with open(path, "r") as f:
             lines = f.readlines()
-            
-        new_lines = []
-        found = False
-        
-        for line in lines:
-            # Check if line is a task, matches snippet, and is not already done
-            if "- [ ]" in line and task_snippet.lower() in line.lower():
-                new_line = line.replace("- [ ]", "- [x]", 1)
-                new_lines.append(new_line)
-                found = True
-            else:
-                new_lines.append(line)
-        
-        if found:
-            with open(path, "w") as f:
-                f.writelines(new_lines)
 
-            # Auto-log to garden journal
-            # Extract clean task description for the log
-            # Line format: "- [ ] Description [Due: ...] (Created: ...)\n"
-            clean_desc = task_snippet # Default fallback
-            matched_line = ""
-            # Try to get the actual line content
-            for line in lines:
-                 if "- [ ]" in line and task_snippet.lower() in line.lower():
-                     matched_line = line
-                     # Remove "- [ ] "
-                     parts = line.split("- [ ] ", 1)
-                     if len(parts) > 1:
-                         clean_desc = parts[1].strip()
-                     break
+        # Find the FIRST matching open task only (prevents silently checking
+        # off multiple tasks while only rescheduling one).
+        matched_idx = None
+        matched_line = ""
+        snippet_lower = task_snippet.lower()
+        for i, line in enumerate(lines):
+            if "- [ ]" in line and snippet_lower in line.lower():
+                matched_idx = i
+                matched_line = line
+                break
 
-            update_journal(f"Completed task: {clean_desc}")
-
-            result_msg = f"Successfully marked task matching '{task_snippet}' as complete and logged to journal."
-
-            # Auto-reschedule recurring tasks
-            if matched_line:
-                recurrence_match = _RECURRENCE_RE.search(matched_line)
-                if recurrence_match:
-                    pattern = recurrence_match.group(1).strip()
-                    due_match = re.search(r'\[Due:\s*(\d{4}-\d{2}-\d{2})\]', matched_line)
-                    if due_match:
-                        next_due = _compute_next_due(due_match.group(1), pattern)
-                        if next_due:
-                            # Extract assignee if present
-                            assigned_match = re.search(r'\[Assigned:\s*([^\]]+)\]', matched_line)
-                            assignee = assigned_match.group(1).strip() if assigned_match else ""
-                            # Extract clean description (strip all metadata)
-                            desc = re.sub(r'^- \[[ x]\] ', '', matched_line.strip())
-                            desc = re.sub(r'\s*\[Assigned:\s*[^\]]*\]', '', desc)
-                            desc = re.sub(r'\s*\[Recurring:\s*[^\]]*\]', '', desc)
-                            desc = re.sub(r'\s*\[Due:\s*[^\]]*\]', '', desc)
-                            desc = re.sub(r'\s*\(Created:\s*[^)]*\)', '', desc).strip()
-                            add_task(desc, due_date=next_due, assigned_to=assignee,
-                                     skip_duplicate_check=True, recurring=pattern)
-                            result_msg += f" Next occurrence scheduled for {next_due}."
-                    else:
-                        result_msg += " Warning: recurring task has no [Due:] date — cannot reschedule."
-
-            return result_msg
-        else:
+        if matched_idx is None:
             return f"No pending task found matching '{task_snippet}'."
+
+        # Check off just this one task
+        lines[matched_idx] = matched_line.replace("- [ ]", "- [x]", 1)
+        with open(path, "w") as f:
+            f.writelines(lines)
+
+        # Extract clean description for journal log
+        clean_desc = task_snippet
+        parts = matched_line.split("- [ ] ", 1)
+        if len(parts) > 1:
+            clean_desc = parts[1].strip()
+
+        update_journal(f"Completed task: {clean_desc}")
+
+        result_msg = f"Successfully marked task matching '{task_snippet}' as complete and logged to journal."
+
+        # Auto-reschedule recurring tasks
+        recurrence_match = _RECURRENCE_RE.search(matched_line)
+        if recurrence_match:
+            pattern = recurrence_match.group(1).strip()
+            due_match = re.search(r'\[Due:\s*(\d{4}-\d{2}-\d{2})\]', matched_line)
+            if due_match:
+                next_due = _compute_next_due(due_match.group(1), pattern)
+                if next_due:
+                    assigned_match = re.search(r'\[Assigned:\s*([^\]]+)\]', matched_line)
+                    assignee = assigned_match.group(1).strip() if assigned_match else ""
+                    desc = re.sub(r'^- \[[ x]\] ', '', matched_line.strip())
+                    desc = re.sub(r'\s*\[Assigned:\s*[^\]]*\]', '', desc)
+                    desc = re.sub(r'\s*\[Recurring:\s*[^\]]*\]', '', desc)
+                    desc = re.sub(r'\s*\[Due:\s*[^\]]*\]', '', desc)
+                    desc = re.sub(r'\s*\(Created:\s*[^)]*\)', '', desc).strip()
+                    add_task(desc, due_date=next_due, assigned_to=assignee,
+                             skip_duplicate_check=True, recurring=pattern)
+                    result_msg += f" Next occurrence scheduled for {next_due}."
+            else:
+                result_msg += " Warning: recurring task has no [Due:] date — cannot reschedule."
+
+        return result_msg
             
     except Exception as e:
         logger.error(f"Failed to complete task: {e}")
