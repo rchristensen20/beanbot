@@ -212,7 +212,7 @@ wheels = [
 
 [[package]]
 name = "beanbot"
-version = "1.8.20"
+version = "1.9.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
